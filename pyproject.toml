@@ -16,3 +16,6 @@ dependencies = [
 
 [project.scripts]
 run-pipeline = "pipeline:main"
+
+[tool.uv]
+dev-dependencies = []
