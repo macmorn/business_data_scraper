@@ -1,4 +1,4 @@
-"""Anthropic Claude API client for disambiguation and career summaries."""
+"""Anthropic Claude API wrapper for disambiguation and career summaries."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import logging
 import anthropic
 
 import config
+from utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -23,143 +24,123 @@ def _get_client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
 
-async def disambiguate_company(
+@with_retry(max_attempts=3, base_delay=2.0, exceptions=(anthropic.APIError,))
+async def disambiguate(
     original_name: str,
     candidates: list[dict],
-    context_hints: str | None = None,
+    context_hints: dict | None = None,
 ) -> dict:
+    """Use Claude to pick the best match from multiple Northdata results.
+
+    Returns dict with 'index' (0-based), 'confidence' (0-1), 'reasoning'.
+    Returns index=-1 if no good match.
     """
-    Use Claude to pick the best matching company from multiple candidates.
+    hints_text = ""
+    if context_hints:
+        hints_text = f"\nAdditional context: {json.dumps(context_hints)}"
 
-    Returns dict with:
-        - "index": int (0-based index of best match, or -1 if unresolvable)
-        - "confidence": float (0.0-1.0)
-        - "reasoning": str
-    """
-    prompt = f"""You are helping match a company name from a PDF to database search results.
+    candidates_text = ""
+    for i, c in enumerate(candidates):
+        candidates_text += (
+            f"\n{i}. {c.get('name', '?')} | {c.get('country', '?')} | "
+            f"{c.get('legal_form', '?')} | {c.get('address', '?')} | "
+            f"status: {c.get('status', '?')}"
+        )
 
-Original company name from PDF: "{original_name}"
-{f'Additional context: {context_hints}' if context_hints else ''}
+    prompt = f"""Given the company name "{original_name}", which of these search results is the best match?
+Consider name similarity, country, active status, and address plausibility.
+{hints_text}
 
-Here are the search result candidates:
-{json.dumps(candidates, indent=2, ensure_ascii=False)}
+Candidates:{candidates_text}
 
-Analyze each candidate and determine which one best matches the original company name.
-Consider: name similarity, country, legal form, active status, and any context hints.
-
-Respond with ONLY valid JSON (no markdown, no code fences):
-{{"index": <0-based index of best match or -1 if none match well>, "confidence": <0.0 to 1.0>, "reasoning": "<brief explanation>"}}"""
+Respond as JSON only: {{"index": N, "confidence": 0.0-1.0, "reasoning": "brief explanation"}}
+If none are a good match, use index: -1."""
 
     async with _semaphore:
         client = _get_client()
-        try:
-            response = await client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
-            )
+        response = await client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
 
-            text = response.content[0].text.strip()
-            # Try to parse JSON response
-            result = json.loads(text)
-            return {
-                "index": int(result.get("index", -1)),
-                "confidence": float(result.get("confidence", 0.0)),
-                "reasoning": result.get("reasoning", ""),
-            }
-        except json.JSONDecodeError:
-            logger.warning("Claude returned non-JSON for disambiguation: %s", text[:200])
-            return {"index": -1, "confidence": 0.0, "reasoning": "Failed to parse AI response"}
-        except Exception as e:
-            logger.error("Claude API error during disambiguation: %s", e)
-            return {"index": -1, "confidence": 0.0, "reasoning": str(e)}
+    text = response.content[0].text.strip()
+    if "```" in text:
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse Claude disambiguation response: %s", text)
+        return {"index": -1, "confidence": 0.0, "reasoning": "Failed to parse response"}
 
 
+@with_retry(max_attempts=3, base_delay=2.0, exceptions=(anthropic.APIError,))
 async def generate_career_summary(
     ceo_name: str,
+    ceo_title: str,
     company_name: str,
-    title: str | None = None,
-    additional_info: str | None = None,
-) -> str | None:
-    """
-    Generate a 2-3 sentence career summary for a CEO.
+    profile_data: dict | None = None,
+) -> str:
+    """Generate a 2-3 sentence career summary for a CEO."""
+    profile_text = ""
+    if profile_data:
+        profile_text = f"\nAvailable profile data: {json.dumps(profile_data, ensure_ascii=False)}"
 
-    Returns summary string or None on failure.
-    """
-    info_parts = []
-    if title:
-        info_parts.append(f"Current title: {title}")
-    if additional_info:
-        info_parts.append(f"Additional info: {additional_info}")
+    prompt = f"""Write a 2-3 sentence professional career summary for {ceo_name}, currently {ceo_title} at {company_name}.
+{profile_text}
 
-    info_str = "\n".join(info_parts) if info_parts else "No additional information available."
-
-    prompt = f"""Write a concise 2-3 sentence professional career summary for {ceo_name}, who is associated with {company_name}.
-
-{info_str}
-
-Write the summary in third person. Focus on their role and the company. If you don't have enough information for a detailed summary, write a brief factual statement about their current role.
-
-Respond with ONLY the summary text, no preamble or explanation."""
+Focus on: career trajectory, notable companies, domain expertise.
+If limited information is available, write what you can based on the role and company.
+Write in third person. Be concise and factual."""
 
     async with _semaphore:
         client = _get_client()
-        try:
-            response = await client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}],
-            )
+        response = await client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
 
-            summary = response.content[0].text.strip()
-            # Basic sanity check
-            if len(summary) < 20 or len(summary) > 500:
-                logger.warning("Career summary unusual length (%d chars) for %s", len(summary), ceo_name)
-            return summary
-        except Exception as e:
-            logger.error("Claude API error during career summary for %s: %s", ceo_name, e)
-            return None
+    return response.content[0].text.strip()
 
 
+@with_retry(max_attempts=3, base_delay=2.0, exceptions=(anthropic.APIError,))
 async def extract_ceo_from_text(
     company_name: str,
-    page_text: str,
+    text: str,
 ) -> dict | None:
+    """Use Claude to extract CEO/leader name from unstructured text.
+
+    Returns dict with 'name' and 'title', or None.
     """
-    Use Claude to extract CEO/leader info from website text.
+    prompt = f"""From the following text about {company_name}, extract the CEO, Geschäftsführer, Managing Director, or primary operational leader.
 
-    Returns dict with: name, title, or None if not found.
-    """
-    # Truncate text to avoid excessive token usage
-    truncated = page_text[:3000]
+Text:
+{text[:3000]}
 
-    prompt = f"""From the following website text for the company "{company_name}", identify the CEO, Managing Director, Geschäftsführer, or primary operational leader.
-
-Website text:
----
-{truncated}
----
-
-If you can identify the CEO/leader, respond with ONLY valid JSON:
-{{"name": "Full Name", "title": "Their Title"}}
-
-If you cannot identify the leader with reasonable confidence, respond with:
-{{"name": null, "title": null}}"""
+Respond as JSON only: {{"name": "Full Name", "title": "Their Title"}}
+If no leader can be identified, respond: {{"name": null, "title": null}}"""
 
     async with _semaphore:
         client = _get_client()
-        try:
-            response = await client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=100,
-                messages=[{"role": "user", "content": prompt}],
-            )
+        response = await client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
+        )
 
-            text = response.content[0].text.strip()
-            result = json.loads(text)
-            if result.get("name"):
-                return {"name": result["name"], "title": result.get("title")}
-            return None
-        except Exception as e:
-            logger.error("Claude API error during CEO extraction for %s: %s", company_name, e)
-            return None
+    result_text = response.content[0].text.strip()
+    if "```" in result_text:
+        result_text = result_text.split("```")[1]
+        if result_text.startswith("json"):
+            result_text = result_text[4:]
+    try:
+        result = json.loads(result_text)
+        if result.get("name"):
+            return result
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse Claude CEO extraction response: %s", result_text)
+
+    return None

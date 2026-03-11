@@ -1,4 +1,8 @@
-"""Stage 6: Normalize and standardize all company fields."""
+"""Stage 6: Normalize and standardize all company fields.
+
+Cleans up data consistency: country codes, legal form names,
+employee/revenue ranges, and computes final confidence scores.
+"""
 
 from __future__ import annotations
 
@@ -8,55 +12,32 @@ import re
 
 import db
 from models import STAGE_PENDING_NORMALIZE, STAGE_PENDING_EXPORT
+from utils.logging_setup import ProgressTracker
 
 logger = logging.getLogger(__name__)
 
-# Country code normalization
-COUNTRY_ALIASES = {
-    "GERMANY": "DE", "DEUTSCHLAND": "DE",
-    "AUSTRIA": "AT", "ÖSTERREICH": "AT",
-    "SWITZERLAND": "CH", "SCHWEIZ": "CH", "SUISSE": "CH",
-    "FRANCE": "FR", "FRANKREICH": "FR",
-    "NETHERLANDS": "NL", "NEDERLAND": "NL",
-    "BELGIUM": "BE", "BELGIQUE": "BE", "BELGIEN": "BE",
-    "ITALY": "IT", "ITALIA": "IT", "ITALIEN": "IT",
-    "SPAIN": "ES", "ESPAÑA": "ES", "SPANIEN": "ES",
-    "LUXEMBOURG": "LU", "LUXEMBURG": "LU",
-    "IRELAND": "IE", "IRLAND": "IE",
-    "PORTUGAL": "PT",
-    "DENMARK": "DK", "DÄNEMARK": "DK",
-    "SWEDEN": "SE", "SCHWEDEN": "SE",
-    "FINLAND": "FI", "FINNLAND": "FI",
-    "NORWAY": "NO", "NORWEGEN": "NO",
-    "POLAND": "PL", "POLEN": "PL",
-    "CZECH REPUBLIC": "CZ", "TSCHECHIEN": "CZ",
-    "HUNGARY": "HU", "UNGARN": "HU",
-    "ROMANIA": "RO", "RUMÄNIEN": "RO",
-    "CROATIA": "HR", "KROATIEN": "HR",
-}
-
-# Legal form normalization
+# Standardized legal form mapping
 LEGAL_FORM_MAP = {
-    "GESELLSCHAFT MIT BESCHRÄNKTER HAFTUNG": "GmbH",
-    "GESELLSCHAFT MIT BESCHRAENKTER HAFTUNG": "GmbH",
-    "AKTIENGESELLSCHAFT": "AG",
-    "KOMMANDITGESELLSCHAFT": "KG",
-    "OFFENE HANDELSGESELLSCHAFT": "OHG",
-    "EINGETRAGENER KAUFMANN": "e.K.",
-    "UNTERNEHMERGESELLSCHAFT": "UG",
-    "SOCIÉTÉ PAR ACTIONS SIMPLIFIÉE": "SAS",
-    "SOCIÉTÉ À RESPONSABILITÉ LIMITÉE": "SARL",
-    "SOCIÉTÉ ANONYME": "SA",
-    "BESLOTEN VENNOOTSCHAP": "BV",
-    "NAAMLOZE VENNOOTSCHAP": "NV",
-    "SOCIETAS EUROPAEA": "SE",
-    "SOCIETÀ PER AZIONI": "S.p.A.",
-    "SOCIETÀ A RESPONSABILITÀ LIMITATA": "S.r.l.",
-    "SOCIEDAD LIMITADA": "S.L.",
-    "SOCIEDAD ANÓNIMA": "S.A.",
-    "PUBLIC LIMITED COMPANY": "PLC",
-    "LIMITED": "Ltd",
-    "PRIVATE LIMITED": "Ltd",
+    "gesellschaft mit beschränkter haftung": "GmbH",
+    "gesellschaft m.b.h.": "GmbH",
+    "aktiengesellschaft": "AG",
+    "kommanditgesellschaft": "KG",
+    "offene handelsgesellschaft": "OHG",
+    "eingetragener kaufmann": "e.K.",
+    "unternehmergesellschaft": "UG",
+    "societas europaea": "SE",
+    "société par actions simplifiée": "SAS",
+    "société à responsabilité limitée": "SARL",
+    "société anonyme": "SA",
+    "besloten vennootschap": "B.V.",
+    "naamloze vennootschap": "N.V.",
+    "società per azioni": "S.p.A.",
+    "società a responsabilità limitata": "S.r.l.",
+    "sociedad limitada": "S.L.",
+    "sociedad anónima": "S.A.",
+    "public limited company": "PLC",
+    "limited": "Ltd",
+    "private limited": "Ltd",
 }
 
 EMPLOYEE_BUCKETS = [
@@ -65,138 +46,105 @@ EMPLOYEE_BUCKETS = [
     (51, 200, "51-200"),
     (201, 500, "201-500"),
     (501, 1000, "501-1000"),
-    (1001, 5000, "1001-5000"),
-    (5001, 10000, "5001-10000"),
-    (10001, float("inf"), "10000+"),
+    (1001, float("inf"), "1000+"),
 ]
 
 
 def run() -> None:
-    """Normalize all fields for completed companies."""
+    """Normalize all pending companies."""
     companies = db.get_pending(STAGE_PENDING_NORMALIZE, limit=10000)
     if not companies:
         logger.info("Stage 6: No companies pending normalization")
         return
 
     logger.info("=" * 40)
-    logger.info("Stage 6: Normalize (%d companies)", len(companies))
+    logger.info("Stage 6: Normalization (%d companies)", len(companies))
     logger.info("=" * 40)
+
+    tracker = ProgressTracker(len(companies), "normalize")
 
     for company in companies:
         try:
-            # Normalize country
-            if company.country:
-                company.country = _normalize_country(company.country)
-
             # Normalize legal form
             if company.legal_form:
                 company.legal_form = _normalize_legal_form(company.legal_form)
+
+            # Ensure matched_name has a value
+            if not company.matched_name:
+                company.matched_name = company.name_original
 
             # Normalize employee range
             if company.employees_range:
                 company.employees_range = _normalize_employee_range(company.employees_range)
 
-            # Normalize status
-            if company.status:
-                company.status = _normalize_status(company.status)
+            # Compute confidence score if not already set
+            if company.confidence_score is None:
+                company.confidence_score = _compute_confidence(company)
 
-            # Compute confidence score
-            company.confidence_score = _compute_confidence(company)
-
-            # Set needs_review flag
-            if company.confidence_score is not None and company.confidence_score < 0.6:
+            # Set needs_review if confidence is low
+            if company.confidence_score is not None and company.confidence_score < 0.5:
                 company.needs_review_flag = True
-
-            # Ensure matched_name is set
-            if not company.matched_name:
-                company.matched_name = company.name_original
 
             company.stage = STAGE_PENDING_EXPORT
             db.update_company(company)
+            tracker.tick(company.name_original, f"confidence={company.confidence_score:.2f}" if company.confidence_score else "normalized")
 
         except Exception as e:
-            logger.error("Normalization error for '%s': %s", company.name_original, e)
+            logger.error("Normalize error for '%s': %s", company.name_original, e)
             db.mark_failed(company.id, str(e))
 
-    logger.info("Stage 6 complete: %d companies normalized", len(companies))
-
-
-def _normalize_country(country: str) -> str:
-    """Normalize country to ISO 3166-1 alpha-2."""
-    c = country.strip().upper()
-    # Already a 2-letter code
-    if len(c) == 2 and c.isalpha():
-        return c
-    # Look up alias
-    return COUNTRY_ALIASES.get(c, c)
+    tracker.summary({"normalized": len(companies)})
 
 
 def _normalize_legal_form(form: str) -> str:
-    """Normalize legal form to standard abbreviation."""
-    f = form.strip().upper()
-    if f in LEGAL_FORM_MAP:
-        return LEGAL_FORM_MAP[f]
-    # Check if it's already a standard abbreviation
-    for std in LEGAL_FORM_MAP.values():
-        if f == std.upper():
-            return std
+    """Normalize a legal form name to its standard abbreviation."""
+    form_lower = form.strip().lower()
+    for full, abbrev in LEGAL_FORM_MAP.items():
+        if full in form_lower:
+            return abbrev
     return form.strip()
 
 
-def _normalize_employee_range(emp_str: str) -> str:
-    """Normalize employee count/range to standard buckets."""
+def _normalize_employee_range(raw: str) -> str:
+    """Normalize employee count to standard range buckets."""
     # Try to extract numbers
-    numbers = re.findall(r"\d+", emp_str.replace(",", "").replace(".", ""))
+    numbers = re.findall(r"[\d,]+", raw.replace(".", ""))
     if not numbers:
-        return emp_str
+        return raw
 
     try:
-        if len(numbers) >= 2:
-            low, high = int(numbers[0]), int(numbers[-1])
-            mid = (low + high) // 2
-        else:
-            mid = int(numbers[0])
-
-        for lo, hi, label in EMPLOYEE_BUCKETS:
-            if lo <= mid <= hi:
+        # Take the largest number as the employee count
+        count = max(int(n.replace(",", "")) for n in numbers)
+        for low, high, label in EMPLOYEE_BUCKETS:
+            if low <= count <= high:
                 return label
-        return emp_str
     except ValueError:
-        return emp_str
+        pass
 
-
-def _normalize_status(status: str) -> str:
-    """Normalize company status."""
-    s = status.strip().lower()
-    if any(w in s for w in ["active", "aktiv", "registered", "inscrit", "live"]):
-        return "active"
-    if any(w in s for w in ["dissolved", "gelöscht", "liquidat", "insolv", "closed", "struck"]):
-        return "dissolved"
-    return status.strip()
+    return raw
 
 
 def _compute_confidence(company) -> float:
-    """Compute overall confidence score (0.0 - 1.0) based on data completeness."""
+    """Compute an overall confidence score based on data completeness."""
     score = 0.0
-    weights = {
-        "matched_name": 0.15,
-        "country": 0.15,
-        "legal_form": 0.10,
-        "status": 0.10,
-        "founded_year": 0.05,
-        "address": 0.10,
-        "officers": 0.10,
-        "ceo_name": 0.15,
-        "data_sources_used": 0.10,
-    }
+    total_weight = 0.0
 
-    for field, weight in weights.items():
-        val = getattr(company, field, None)
-        if val:
+    # Fields and their weights
+    checks = [
+        (company.matched_name and company.matched_name != company.name_original, 0.2),
+        (company.country is not None, 0.15),
+        (company.legal_form is not None, 0.1),
+        (company.status is not None, 0.1),
+        (company.founded_year is not None, 0.1),
+        (company.address is not None, 0.1),
+        (company.officers is not None, 0.1),
+        (company.ceo_name is not None, 0.1),
+        (company.data_sources_used is not None, 0.05),
+    ]
+
+    for has_value, weight in checks:
+        total_weight += weight
+        if has_value:
             score += weight
 
-    # Existing confidence from disambiguation overrides if higher
-    if company.confidence_score and company.confidence_score > score:
-        return company.confidence_score
-
-    return round(score, 2)
+    return round(score / total_weight, 2) if total_weight > 0 else 0.0

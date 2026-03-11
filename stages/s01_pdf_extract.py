@@ -1,122 +1,209 @@
-"""Stage 1: Extract company names from PDF, deduplicate, and load into queue."""
+"""Stage 1: Extract company records from PDF, deduplicate, and load into queue.
+
+Uses pdftotext (poppler) as the extraction backend because many supplier-list
+PDFs use custom font encodings that break Python PDF libraries. The parsing
+is driven by layout configs defined in pdf_layouts.py.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import subprocess
 from pathlib import Path
-
-import pdfplumber
 
 import config
 import db
 from models import STAGE_PENDING_NORTHDATA
+from pdf_layouts import LAYOUTS, DEFAULT_LAYOUT, PDFLayout
 
 logger = logging.getLogger(__name__)
 
-# Legal form suffixes used to identify company names in text
-LEGAL_FORMS = [
-    # German
-    "GmbH", "GmbH & Co. KG", "GmbH & Co. KGaA", "AG", "KG", "OHG", "e.K.", "UG",
-    # Austrian
-    "GesmbH",
-    # Swiss
-    "SA", "Sàrl",
-    # French
-    "SAS", "SARL", "S.A.", "S.A.S.", "S.A.R.L.", "SCA", "SNC",
-    # Dutch / Belgian
-    "B.V.", "BV", "N.V.", "NV", "VOF", "BVBA", "SPRL",
-    # Italian
-    "S.p.A.", "S.r.l.", "SPA", "SRL",
-    # Spanish
-    "S.L.", "S.A.",
-    # General European
-    "Ltd", "Ltd.", "Limited", "PLC", "SE", "SCE",
-]
 
-# Build regex pattern to match company names ending with legal forms
-_legal_escaped = [re.escape(lf) for lf in sorted(LEGAL_FORMS, key=len, reverse=True)]
-_legal_pattern = "|".join(_legal_escaped)
-# Match: word characters/spaces/hyphens followed by a legal form
-COMPANY_RE = re.compile(
-    rf"([\w\s\-&.,/'+()]+?\s*(?:{_legal_pattern}))\b",
-    re.IGNORECASE | re.UNICODE,
-)
+def extract_text_pdftotext(pdf_path: str) -> str:
+    """Extract text from PDF using pdftotext (poppler-utils).
 
-
-def extract_names_from_pdf(pdf_path: str) -> list[str]:
-    """Extract company names from a PDF file."""
+    This handles custom font encodings that break pdfplumber/PyMuPDF.
+    Requires poppler-utils to be installed (apt-get install poppler-utils).
+    """
     path = Path(pdf_path)
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    names = []
-    with pdfplumber.open(str(path)) as pdf:
-        logger.info("Processing PDF: %s (%d pages)", path.name, len(pdf.pages))
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if not text:
-                continue
-            # Try regex extraction first
-            matches = COMPANY_RE.findall(text)
-            for match in matches:
-                name = _clean_name(match)
-                if name and len(name) >= 3:
-                    names.append(name)
+    result = subprocess.run(
+        ["pdftotext", str(path), "-"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"pdftotext failed: {result.stderr}")
 
-            # Also try line-by-line extraction for simple lists
-            for line in text.split("\n"):
-                line = line.strip()
-                if _looks_like_company(line):
-                    name = _clean_name(line)
-                    if name and len(name) >= 3:
-                        names.append(name)
-
-    logger.info("Extracted %d raw company names from PDF", len(names))
-    return names
+    logger.info("Extracted text from %s (%d characters)", path.name, len(result.stdout))
+    return result.stdout
 
 
-def _clean_name(name: str) -> str:
-    """Clean up an extracted company name."""
-    name = name.strip()
-    # Remove leading numbers/bullets
-    name = re.sub(r"^[\d\.\)\-\*•]+\s*", "", name)
-    # Remove excessive whitespace
-    name = re.sub(r"\s+", " ", name)
-    return name.strip()
+def extract_text_pymupdf(pdf_path: str) -> str:
+    """Fallback: extract text using PyMuPDF. Works for standard font PDFs."""
+    import fitz
+    path = Path(pdf_path)
+    if not path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    doc = fitz.open(str(path))
+    pages_text = []
+    for page in doc:
+        pages_text.append(page.get_text())
+    text = "\n".join(pages_text)
+    logger.info("Extracted text from %s via PyMuPDF (%d characters)", path.name, len(text))
+    return text
 
 
-def _looks_like_company(line: str) -> bool:
-    """Heuristic: does this line look like a company name?"""
-    if not line or len(line) < 5 or len(line) > 200:
-        return False
-    # Check if line contains any legal form suffix
-    line_upper = line.upper()
-    for lf in LEGAL_FORMS:
-        if lf.upper() in line_upper:
-            return True
-    return False
+def extract_text(pdf_path: str) -> str:
+    """Extract text from PDF, trying pdftotext first, then PyMuPDF."""
+    try:
+        return extract_text_pdftotext(pdf_path)
+    except (FileNotFoundError, RuntimeError) as e:
+        if "PDF not found" in str(e):
+            raise
+        logger.warning("pdftotext failed (%s), trying PyMuPDF fallback", e)
+        return extract_text_pymupdf(pdf_path)
 
 
-def deduplicate(names: list[str]) -> list[str]:
-    """Deduplicate company names using normalized comparison."""
-    seen = {}
+def clean_lines(text: str, layout: PDFLayout) -> list[str]:
+    """Strip blank lines and filter out header/footer/boilerplate lines."""
+    lines = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Skip by substring match
+        if any(pat in line for pat in layout.skip_patterns):
+            continue
+        # Skip exact matches
+        if line in layout.skip_exact:
+            continue
+        # Skip standalone page numbers
+        if re.match(r"^\d{1,2}$", line):
+            continue
+        lines.append(line)
+    return lines
+
+
+def parse_records(lines: list[str], layout: PDFLayout) -> list[dict]:
+    """Parse cleaned lines into structured records based on layout config.
+
+    The layout defines a repeating block of N fields. We scan for lines
+    matching the key field pattern, then consume the next N-1 lines as
+    the remaining fields.
+    """
+    record_re = re.compile(layout.record_start_pattern)
+    fields_per_record = len(layout.fields)
+    records = []
+
+    i = 0
+    while i <= len(lines) - fields_per_record:
+        # Look for the start of a record (the key field)
+        key_field = next(f for f in layout.fields if f.is_key)
+        if not record_re.match(lines[i]):
+            i += 1
+            continue
+
+        # Consume all fields in this record block
+        record = {}
+        valid = True
+        for j, field_def in enumerate(layout.fields):
+            if i + j >= len(lines):
+                valid = False
+                break
+            record[field_def.name] = lines[i + j]
+
+        if valid:
+            records.append(record)
+        i += fields_per_record
+
+    logger.info("Parsed %d raw records from PDF", len(records))
+    return records
+
+
+def deduplicate_records(records: list[dict], layout: PDFLayout) -> list[dict]:
+    """Deduplicate records by company name, optionally collecting a field."""
+    if not layout.has_duplicate_rows:
+        return records
+
+    # Determine the name field
+    name_field = "company_name"
+    for field_def in layout.fields:
+        mapped = layout.field_mapping.get(field_def.name, field_def.name)
+        if mapped == "name_original":
+            name_field = field_def.name
+            break
+
+    seen: dict[str, dict] = {}
     unique = []
-    for name in names:
-        key = _normalize_for_dedup(name)
+    collect_field = layout.dedup_collect_field
+
+    for record in records:
+        key = record.get(name_field, "").strip().lower()
+        if not key:
+            continue
+
         if key not in seen:
-            seen[key] = name
-            unique.append(name)
+            # First occurrence - initialize collected fields
+            if collect_field and collect_field in record:
+                record["_collected"] = [record[collect_field]]
+            seen[key] = record
+            unique.append(record)
+        else:
+            # Duplicate - collect the merge field if configured
+            if collect_field and collect_field in record:
+                existing = seen[key]
+                existing.setdefault("_collected", [])
+                val = record[collect_field]
+                if val not in existing["_collected"]:
+                    existing["_collected"].append(val)
+
+    # Flatten collected fields back
+    if collect_field:
+        for record in unique:
+            collected = record.pop("_collected", [])
+            if collected:
+                record[collect_field] = "; ".join(collected)
+
+    logger.info("After deduplication: %d unique companies (from %d records)", len(unique), len(records))
     return unique
 
 
-def _normalize_for_dedup(name: str) -> str:
-    """Normalize a name for deduplication comparison."""
-    n = name.lower().strip()
-    # Remove punctuation for comparison
-    n = re.sub(r"[.,\-/'+()]", " ", n)
-    n = re.sub(r"\s+", " ", n)
-    return n.strip()
+def apply_field_mapping(records: list[dict], layout: PDFLayout) -> list[dict]:
+    """Rename fields from layout-specific names to CompanyRecord names."""
+    mapped = []
+    for record in records:
+        new = {}
+        for key, value in record.items():
+            mapped_name = layout.field_mapping.get(key, key)
+            new[mapped_name] = value
+        mapped.append(new)
+    return mapped
+
+
+def build_address(record: dict) -> str | None:
+    """Combine address_street, address_city, address_country into one string."""
+    parts = []
+    for field in ("address_street", "address_city", "address_country"):
+        val = record.get(field)
+        if val and val.strip():
+            parts.append(val.strip())
+    return ", ".join(parts) if parts else None
+
+
+def get_layout() -> PDFLayout:
+    """Get the active PDF layout from config."""
+    layout_name = os.environ.get("PDF_LAYOUT", DEFAULT_LAYOUT)
+    if layout_name not in LAYOUTS:
+        logger.warning("Unknown layout '%s', falling back to '%s'", layout_name, DEFAULT_LAYOUT)
+        layout_name = DEFAULT_LAYOUT
+    layout = LAYOUTS[layout_name]
+    logger.info("Using PDF layout: %s (%s)", layout.name, layout.description)
+    return layout
 
 
 def run() -> None:
@@ -125,13 +212,49 @@ def run() -> None:
     logger.info("Stage 1: PDF Extraction")
     logger.info("=" * 40)
 
+    layout = get_layout()
     pdf_path = config.INPUT_PDF
-    names = extract_names_from_pdf(pdf_path)
-    unique_names = deduplicate(names)
-    logger.info("After deduplication: %d unique companies", len(unique_names))
 
-    count = db.load_companies(unique_names)
+    # Extract text
+    text = extract_text(pdf_path)
+
+    # Clean and parse
+    lines = clean_lines(text, layout)
+    logger.info("Cleaned text: %d non-empty lines", len(lines))
+
+    records = parse_records(lines, layout)
+    records = deduplicate_records(records, layout)
+    records = apply_field_mapping(records, layout)
+
+    # Load into database
+    names = []
+    extra_data = {}  # name -> extra fields from PDF
+    for record in records:
+        name = record.get("name_original", "").strip()
+        if not name or len(name) < 2:
+            continue
+        names.append(name)
+
+        # Store extra data from the PDF (address, country, etc.)
+        extras = {}
+        address = build_address(record)
+        if address:
+            extras["address"] = address
+        country_raw = record.get("address_country")
+        if country_raw:
+            extras["country"] = _normalize_country(country_raw)
+        for extra_field in ("vendor_code", "cage_code", "product_group"):
+            if extra_field in record:
+                extras[extra_field] = record[extra_field]
+        if extras:
+            extra_data[name] = extras
+
+    count = db.load_companies(names)
     logger.info("Loaded %d new companies into queue", count)
+
+    # Apply extra data from PDF to database records
+    if extra_data:
+        _apply_extra_data(extra_data)
 
     # Advance all 'new' companies to pending_northdata
     with db._get_conn() as conn:
@@ -139,4 +262,68 @@ def run() -> None:
             "UPDATE companies SET stage = ? WHERE stage = 'new'",
             (STAGE_PENDING_NORTHDATA,),
         )
-    logger.info("Stage 1 complete")
+
+    logger.info("Stage 1 complete: %d companies queued", len(names))
+
+
+def _apply_extra_data(extra_data: dict[str, dict]) -> None:
+    """Write PDF-sourced extra fields (address, country) into the database."""
+    with db._get_conn() as conn:
+        for name, extras in extra_data.items():
+            updates = []
+            params = []
+            if "address" in extras:
+                updates.append("address = ?")
+                params.append(extras["address"])
+            if "country" in extras:
+                updates.append("country = ?")
+                params.append(extras["country"])
+            if updates:
+                params.append(name)
+                conn.execute(
+                    f"UPDATE companies SET {', '.join(updates)} WHERE name_original = ?",
+                    params,
+                )
+    logger.info("Applied extra PDF data to %d companies", len(extra_data))
+
+
+def _normalize_country(country_raw: str) -> str | None:
+    """Normalize country name to ISO 3166-1 alpha-2 code."""
+    mapping = {
+        "germany": "DE", "deutschland": "DE",
+        "france": "FR", "frankreich": "FR",
+        "spain": "ES", "spanien": "ES", "espana": "ES", "españa": "ES",
+        "usa": "US", "united states": "US",
+        "great britain": "GB", "united kingdom": "GB", "uk": "GB",
+        "italy": "IT", "italien": "IT", "italia": "IT",
+        "belgium": "BE", "belgien": "BE", "belgique": "BE",
+        "switzerland": "CH", "schweiz": "CH", "suisse": "CH",
+        "netherlands": "NL", "nederland": "NL",
+        "austria": "AT", "österreich": "AT",
+        "luxembourg": "LU", "luxemburg": "LU",
+        "portugal": "PT",
+        "denmark": "DK", "dänemark": "DK",
+        "sweden": "SE", "schweden": "SE",
+        "finland": "FI", "finnland": "FI",
+        "norway": "NO", "norwegen": "NO",
+        "poland": "PL", "polen": "PL",
+        "czech republic": "CZ", "tschechien": "CZ",
+        "hungary": "HU", "ungarn": "HU",
+        "romania": "RO", "rumänien": "RO",
+        "ireland": "IE", "irland": "IE",
+        "malaysia": "MY",
+        "china": "CN",
+        "japan": "JP",
+        "india": "IN",
+        "canada": "CA",
+        "mexico": "MX",
+        "brazil": "BR",
+        "australia": "AU",
+        "south korea": "KR",
+        "singapore": "SG",
+        "taiwan": "TW",
+        "turkey": "TR", "türkei": "TR",
+        "israel": "IL",
+    }
+    key = country_raw.strip().lower()
+    return mapping.get(key, country_raw.strip()[:2].upper())

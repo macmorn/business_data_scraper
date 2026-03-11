@@ -24,6 +24,9 @@ OUTPUT_CSV = os.environ.get("OUTPUT_CSV", "output/companies_enriched.csv")
 DB_PATH = os.environ.get("DB_PATH", "data/pipeline.db")
 LOG_FILE = os.environ.get("LOG_FILE", "output/pipeline.log")
 
+# PDF parsing
+PDF_LAYOUT = os.environ.get("PDF_LAYOUT", "airbus_suppliers")
+
 # Claude
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
