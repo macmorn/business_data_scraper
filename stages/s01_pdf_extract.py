@@ -15,7 +15,7 @@ from pathlib import Path
 
 import config
 import db
-from models import STAGE_PENDING_NORTHDATA
+from models import STAGE_PENDING_NORTHDATA, STAGE_PENDING_FALLBACK
 from pdf_layouts import LAYOUTS, DEFAULT_LAYOUT, PDFLayout
 
 logger = logging.getLogger(__name__)
@@ -206,8 +206,14 @@ def get_layout() -> PDFLayout:
     return layout
 
 
-def run() -> None:
-    """Execute PDF extraction stage."""
+def run(country_filter: set[str] | None = None) -> None:
+    """Execute PDF extraction stage.
+
+    Args:
+        country_filter: If provided, only keep companies from these ISO country
+                        codes (e.g. {"DE", "FR"}). If None, uses the default
+                        NORTHDATA_COUNTRIES set.
+    """
     logger.info("=" * 40)
     logger.info("Stage 1: PDF Extraction")
     logger.info("=" * 40)
@@ -256,14 +262,79 @@ def run() -> None:
     if extra_data:
         _apply_extra_data(extra_data)
 
-    # Advance all 'new' companies to pending_northdata
-    with db._get_conn() as conn:
-        conn.execute(
-            "UPDATE companies SET stage = ? WHERE stage = 'new'",
-            (STAGE_PENDING_NORTHDATA,),
-        )
+    # Route companies based on country: included → Northdata, excluded → dropped
+    _route_by_region(extra_data, country_filter=country_filter)
 
     logger.info("Stage 1 complete: %d companies queued", len(names))
+
+
+# Countries covered by Northdata (European company search engine)
+NORTHDATA_COUNTRIES = {
+    "AT", "BE", "BG", "CH", "CZ", "DE", "DK", "EE", "ES", "FI",
+    "FR", "GB", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV",
+    "NL", "NO", "PL", "PT", "RO", "SE", "SI", "SK",
+}
+
+
+def _route_by_region(
+    extra_data: dict[str, dict],
+    country_filter: set[str] | None = None,
+) -> None:
+    """Filter companies by country. Non-matching companies are dropped from the pipeline.
+
+    Args:
+        extra_data: PDF-sourced extra fields keyed by company name.
+        country_filter: Set of ISO country codes to keep. If None, uses
+                        NORTHDATA_COUNTRIES as the default filter.
+    """
+    allowed = country_filter or NORTHDATA_COUNTRIES
+    included = []
+    excluded = []
+    unknown = []
+
+    with db._get_conn() as conn:
+        rows = conn.execute(
+            "SELECT name_original, country FROM companies WHERE stage = 'new'"
+        ).fetchall()
+
+        for row in rows:
+            name = row["name_original"]
+            country = row["country"]
+
+            if not country:
+                unknown.append(name)
+            elif country.upper() in allowed:
+                included.append(name)
+            else:
+                excluded.append(name)
+
+        # Advance included + unknown → Northdata
+        if included or unknown:
+            keep_names = included + unknown
+            placeholders = ",".join("?" * len(keep_names))
+            conn.execute(
+                f"UPDATE companies SET stage = ? WHERE stage = 'new' AND name_original IN ({placeholders})",
+                [STAGE_PENDING_NORTHDATA] + keep_names,
+            )
+
+        # Drop excluded companies entirely
+        if excluded:
+            placeholders = ",".join("?" * len(excluded))
+            conn.execute(
+                f"DELETE FROM companies WHERE stage = 'new' AND name_original IN ({placeholders})",
+                excluded,
+            )
+
+    logger.info(
+        "Filter: %d companies kept (%s), %d dropped, %d unknown country kept",
+        len(included), ", ".join(sorted(allowed)), len(excluded), len(unknown),
+    )
+    if excluded:
+        countries = sorted({extra_data.get(n, {}).get("country", "?") for n in excluded})
+        logger.info("Dropped countries: %s", ", ".join(countries))
+        for name in excluded:
+            c = extra_data.get(name, {}).get("country", "?")
+            logger.debug("  Dropped [%s] %s", c, name)
 
 
 def _apply_extra_data(extra_data: dict[str, dict]) -> None:

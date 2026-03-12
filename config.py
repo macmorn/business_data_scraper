@@ -10,13 +10,18 @@ load_dotenv()
 BASE_DIR = Path(__file__).parent
 
 # API keys
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
 PAPPERS_API_KEY = os.environ.get("PAPPERS_API_KEY", "")
 OPENCORPORATES_API_KEY = os.environ.get("OPENCORPORATES_API_KEY", "")
 
-# Rate limits
-NORTHDATA_DELAY_SECONDS = float(os.environ.get("NORTHDATA_DELAY_SECONDS", "2.5"))
+# Northdata
+NORTHDATA_DELAY_MIN = float(os.environ.get("NORTHDATA_DELAY_MIN", "3.0"))
+NORTHDATA_DELAY_MAX = float(os.environ.get("NORTHDATA_DELAY_MAX", "8.0"))
+# Legacy fallback — used only if the caller still references NORTHDATA_DELAY_SECONDS
+NORTHDATA_DELAY_SECONDS = float(os.environ.get("NORTHDATA_DELAY_SECONDS", "5.0"))
+NORTHDATA_EMAIL = os.environ.get("NORTHDATA_EMAIL", "")
+NORTHDATA_PASSWORD = os.environ.get("NORTHDATA_PASSWORD", "")
+NORTHDATA_RETRY_ATTEMPTS = int(os.environ.get("NORTHDATA_RETRY_ATTEMPTS", "2"))
 
 # Paths
 INPUT_PDF = os.environ.get("INPUT_PDF", "input/companies.pdf")
@@ -26,9 +31,6 @@ LOG_FILE = os.environ.get("LOG_FILE", "output/pipeline.log")
 
 # PDF parsing
 PDF_LAYOUT = os.environ.get("PDF_LAYOUT", "airbus_suppliers")
-
-# Claude
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 # Pipeline
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))

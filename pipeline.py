@@ -1,24 +1,120 @@
-"""Main pipeline orchestrator for EU company research."""
+"""Main pipeline orchestrator for EU company research.
+
+Usage:
+    python pipeline.py [OPTIONS]
+
+    # Run with defaults (from .env / config.py)
+    python pipeline.py
+
+    # Specify input PDF and layout
+    python pipeline.py --input suppliers.pdf --layout airbus_suppliers
+
+    # Filter to specific countries only
+    python pipeline.py --countries DE,FR,GB
+
+    # Override output path
+    python pipeline.py --output results.csv
+
+    # Fresh run (delete existing DB first)
+    python pipeline.py --fresh
+
+    # List available PDF layouts
+    python pipeline.py --list-layouts
+"""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import sys
 
+import config
 import db
-from models import STAGE_NEW
+from pdf_layouts import LAYOUTS
+from stages.s01_pdf_extract import NORTHDATA_COUNTRIES
 from utils.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
 
 
-async def run() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="pipeline",
+        description="EU Company Research Pipeline — enrich company data from PDF supplier lists",
+    )
+
+    parser.add_argument(
+        "--input", "-i",
+        metavar="PDF",
+        help="Path to input PDF file (default: from .env INPUT_PDF)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        metavar="CSV",
+        help="Path to output CSV file (default: from .env OUTPUT_CSV)",
+    )
+    parser.add_argument(
+        "--layout", "-l",
+        metavar="NAME",
+        choices=list(LAYOUTS.keys()),
+        help=f"PDF parsing layout (choices: {', '.join(LAYOUTS.keys())})",
+    )
+    parser.add_argument(
+        "--countries", "-c",
+        metavar="CODES",
+        help=(
+            "Comma-separated ISO country codes to include (e.g. DE,FR,GB). "
+            "Companies from other countries are dropped at ingestion. "
+            "Default: all Northdata-covered European countries"
+        ),
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Delete existing database and start from scratch",
+    )
+    parser.add_argument(
+        "--list-layouts",
+        action="store_true",
+        help="List available PDF layouts and exit",
+    )
+    parser.add_argument(
+        "--db",
+        metavar="PATH",
+        help="Path to SQLite database (default: from .env DB_PATH)",
+    )
+
+    return parser.parse_args(argv)
+
+
+def apply_overrides(args: argparse.Namespace) -> set[str] | None:
+    """Apply CLI overrides to config and return country filter set (or None for default)."""
+    if args.input:
+        config.INPUT_PDF = args.input
+    if args.output:
+        config.OUTPUT_CSV = args.output
+    if args.layout:
+        config.PDF_LAYOUT = args.layout
+    if args.db:
+        config.DB_PATH = args.db
+
+    country_filter = None
+    if args.countries:
+        country_filter = {c.strip().upper() for c in args.countries.split(",") if c.strip()}
+
+    return country_filter
+
+
+async def run(country_filter: set[str] | None = None) -> None:
     """Run all pipeline stages in sequence. Resumable on restart."""
     setup_logging()
     logger.info("=" * 60)
     logger.info("EU Company Research Pipeline - Starting")
     logger.info("=" * 60)
+
+    if country_filter:
+        logger.info("Country filter: %s", ", ".join(sorted(country_filter)))
 
     # Initialize database
     db.init_db()
@@ -26,7 +122,7 @@ async def run() -> None:
     # Stage 1: PDF extraction (only if DB is empty)
     if db.count_total() == 0:
         from stages.s01_pdf_extract import run as run_extract
-        run_extract()
+        run_extract(country_filter=country_filter)
     else:
         logger.info("Database already populated (%d companies), skipping PDF extraction", db.count_total())
 
@@ -65,9 +161,34 @@ async def run() -> None:
     logger.info("=" * 60)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Entry point."""
-    asyncio.run(run())
+    args = parse_args(argv)
+
+    # Handle --list-layouts
+    if args.list_layouts:
+        print("Available PDF layouts:\n")
+        for key, layout in LAYOUTS.items():
+            fields = ", ".join(f.name for f in layout.fields)
+            print(f"  {key}")
+            print(f"    {layout.description}")
+            print(f"    Fields: {fields}")
+            print()
+        print(f"Northdata-covered countries ({len(NORTHDATA_COUNTRIES)}):")
+        print(f"  {', '.join(sorted(NORTHDATA_COUNTRIES))}")
+        return
+
+    # Handle --fresh
+    if args.fresh:
+        import pathlib
+        db_path = args.db or config.DB_PATH
+        p = pathlib.Path(db_path)
+        if p.exists():
+            p.unlink()
+            print(f"Deleted {p}")
+
+    country_filter = apply_overrides(args)
+    asyncio.run(run(country_filter=country_filter))
 
 
 if __name__ == "__main__":

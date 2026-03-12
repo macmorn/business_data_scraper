@@ -8,7 +8,7 @@ dependencies = [
     "playwright>=1.40",
     "playwright-stealth>=1.0",
     "httpx>=0.25",
-    "anthropic>=0.40",
+    "claude-agent-sdk",
     "pandas>=2.1",
     "python-dotenv>=1.0",
     "beautifulsoup4>=4.12",

@@ -36,6 +36,35 @@ class CompanyRecord:
     last_accounts_year: int | None = None
     officers: str | None = None  # JSON array string
 
+    # Identification
+    register_id: str | None = None  # e.g. "HRB 1878"
+    register_court: str | None = None  # e.g. "District Court of Neuss"
+    lei: str | None = None  # Legal Entity Identifier
+    vat_id: str | None = None  # VAT identification number
+
+    # Financials (most recent year from Northdata KPI table, JSON for history)
+    revenue: str | None = None  # Most recent revenue value
+    earnings: str | None = None  # Most recent earnings value
+    total_assets: str | None = None
+    equity: str | None = None
+    equity_ratio: str | None = None
+    employees_count: str | None = None  # Exact count from KPI table
+    return_on_sales: str | None = None
+    cost_of_materials: str | None = None
+    wages_and_salaries: str | None = None
+    cash_on_hand: str | None = None
+    liabilities: str | None = None
+    pension_provisions: str | None = None
+    auditor: str | None = None
+    financials_json: str | None = None  # Full KPI history as JSON
+
+    # Public funding
+    public_funding_total: str | None = None
+
+    # Corporate purpose / industry
+    corporate_purpose: str | None = None
+    industry_code: str | None = None  # e.g. "20.5"
+
     # CEO / leadership
     ceo_name: str | None = None
     ceo_linkedin_url: str | None = None
@@ -47,6 +76,7 @@ class CompanyRecord:
     data_sources_used: str | None = None  # comma-separated
     confidence_score: float | None = None  # 0.0 - 1.0
     needs_review_flag: bool = False
+    northdata_url: str | None = None  # Direct link to Northdata page
 
     # Pipeline control
     stage: str = STAGE_NEW
@@ -61,17 +91,35 @@ class CompanyRecord:
     brave_raw: str | None = None
 
 
-# Output CSV column order (matches design doc)
+# Output CSV column order
 CSV_COLUMNS = [
     "company_name_original",
     "matched_name",
     "country",
     "legal_form",
     "status",
-    "founded_year",
     "address",
-    "employees_range",
-    "revenue_range",
+    "register_id",
+    "register_court",
+    "lei",
+    "vat_id",
+    "industry_code",
+    "corporate_purpose",
+    "founded_year",
+    "employees_count",
+    "revenue",
+    "earnings",
+    "total_assets",
+    "equity",
+    "equity_ratio",
+    "return_on_sales",
+    "cost_of_materials",
+    "wages_and_salaries",
+    "cash_on_hand",
+    "liabilities",
+    "pension_provisions",
+    "auditor",
+    "public_funding_total",
     "last_accounts_year",
     "officers",
     "ceo_name",
@@ -79,7 +127,9 @@ CSV_COLUMNS = [
     "ceo_current_title",
     "ceo_career_summary",
     "ceo_confidence",
+    "northdata_url",
     "data_sources_used",
     "confidence_score",
     "needs_review_flag",
+    "financials_json",
 ]
