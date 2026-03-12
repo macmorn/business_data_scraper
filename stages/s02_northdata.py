@@ -31,11 +31,15 @@ async def run() -> None:
     logger.info("Stage 2: Northdata Lookup (%d companies)", len(companies))
     logger.info("=" * 40)
 
-    rate_limiter = RateLimiter(config.NORTHDATA_DELAY_SECONDS)
+    rate_limiter = RateLimiter(config.NORTHDATA_DELAY_MIN, config.NORTHDATA_DELAY_MAX)
     tracker = ProgressTracker(len(companies), "northdata")
     results = {"found": 0, "multiple": 0, "not_found": 0, "error": 0}
 
-    client = NorthdataClient()
+    client = NorthdataClient(
+        email=config.NORTHDATA_EMAIL,
+        password=config.NORTHDATA_PASSWORD,
+        retry_attempts=config.NORTHDATA_RETRY_ATTEMPTS,
+    )
     try:
         await client.start()
 
@@ -93,7 +97,36 @@ def _apply_company_data(company, data: dict) -> None:
     company.employees_range = data.get("employees_range")
     company.revenue_range = data.get("revenue_range")
     company.last_accounts_year = data.get("last_accounts_year")
+    company.northdata_url = data.get("url")
 
+    # Identification
+    company.register_id = data.get("register_id")
+    company.register_court = data.get("register_court")
+    company.lei = data.get("lei")
+    company.vat_id = data.get("vat_id")
+
+    # Financials
+    company.revenue = data.get("revenue")
+    company.earnings = data.get("earnings")
+    company.total_assets = data.get("total_assets")
+    company.equity = data.get("equity")
+    company.equity_ratio = data.get("equity_ratio")
+    company.employees_count = data.get("employees_count")
+    company.return_on_sales = data.get("return_on_sales")
+    company.cost_of_materials = data.get("cost_of_materials")
+    company.wages_and_salaries = data.get("wages_and_salaries")
+    company.cash_on_hand = data.get("cash_on_hand")
+    company.liabilities = data.get("liabilities")
+    company.pension_provisions = data.get("pension_provisions")
+    company.auditor = data.get("auditor")
+    company.financials_json = data.get("financials_json")
+    company.public_funding_total = data.get("public_funding_total")
+
+    # Corporate info
+    company.corporate_purpose = data.get("corporate_purpose")
+    company.industry_code = data.get("industry_code")
+
+    # Officers
     officers = data.get("officers", [])
     if officers:
         company.officers = json.dumps(officers, ensure_ascii=False)
