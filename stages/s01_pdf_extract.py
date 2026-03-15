@@ -263,9 +263,9 @@ def run(country_filter: set[str] | None = None) -> None:
         _apply_extra_data(extra_data)
 
     # Route companies based on country: included → Northdata, excluded → dropped
-    _route_by_region(extra_data, country_filter=country_filter)
+    kept = _route_by_region(extra_data, country_filter=country_filter)
 
-    logger.info("Stage 1 complete: %d companies queued", len(names))
+    logger.info("Stage 1 complete: %d companies queued (of %d extracted)", kept, len(names))
 
 
 # Countries covered by Northdata (European company search engine)
@@ -279,7 +279,7 @@ NORTHDATA_COUNTRIES = {
 def _route_by_region(
     extra_data: dict[str, dict],
     country_filter: set[str] | None = None,
-) -> None:
+) -> int:
     """Filter companies by country. Non-matching companies are dropped from the pipeline.
 
     Args:
@@ -335,6 +335,8 @@ def _route_by_region(
         for name in excluded:
             c = extra_data.get(name, {}).get("country", "?")
             logger.debug("  Dropped [%s] %s", c, name)
+
+    return len(included) + len(unknown)
 
 
 def _apply_extra_data(extra_data: dict[str, dict]) -> None:

@@ -10,6 +10,7 @@ STAGE_NEW = "new"
 STAGE_PENDING_NORTHDATA = "pending_northdata"
 STAGE_PENDING_FALLBACK = "pending_fallback"
 STAGE_PENDING_CEO = "pending_ceo"
+STAGE_PENDING_STRUCTURE = "pending_structure"
 STAGE_PENDING_AI = "pending_ai"
 STAGE_PENDING_NORMALIZE = "pending_normalize"
 STAGE_PENDING_EXPORT = "pending_export"
@@ -58,6 +59,10 @@ class CompanyRecord:
     auditor: str | None = None
     financials_json: str | None = None  # Full KPI history as JSON
 
+    # Notes columns (original formatted values + source context)
+    revenue_notes: str | None = None
+    employees_notes: str | None = None
+
     # Public funding
     public_funding_total: str | None = None
 
@@ -71,6 +76,9 @@ class CompanyRecord:
     ceo_current_title: str | None = None
     ceo_career_summary: str | None = None
     ceo_confidence: str | None = None  # high / medium / not found
+
+    # Corporate structure
+    corporate_structure_summary: str | None = None
 
     # Metadata
     data_sources_used: str | None = None  # comma-separated
@@ -107,7 +115,11 @@ CSV_COLUMNS = [
     "corporate_purpose",
     "founded_year",
     "employees_count",
+    "employees_notes",
+    "employees_range",
     "revenue",
+    "revenue_notes",
+    "revenue_range",
     "earnings",
     "total_assets",
     "equity",
@@ -127,6 +139,7 @@ CSV_COLUMNS = [
     "ceo_current_title",
     "ceo_career_summary",
     "ceo_confidence",
+    "corporate_structure_summary",
     "northdata_url",
     "data_sources_used",
     "confidence_score",

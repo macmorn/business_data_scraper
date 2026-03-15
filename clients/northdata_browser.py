@@ -159,10 +159,13 @@ class NorthdataClient:
             await self._pw.stop()
         logger.info("Northdata browser closed")
 
-    async def search(self, company_name: str) -> dict:
+    async def search(self, company_name: str, search_hint: str | None = None) -> dict:
         """
         Search northdata.com for a company via the homepage autocomplete.
         Retries up to self._retry_attempts times on not_found/error.
+
+        If search_hint (e.g. city name) is provided and the initial search
+        returns multiple or not_found, retries once with "{name} {hint}".
 
         Returns dict with:
             - "status": "found" | "multiple" | "not_found" | "error"
@@ -176,7 +179,7 @@ class NorthdataClient:
             last_result = result
 
             if result["status"] in ("found", "multiple"):
-                return result
+                break
 
             # Only retry on not_found or transient errors
             if attempt < self._retry_attempts:
@@ -185,10 +188,18 @@ class NorthdataClient:
                     attempt, self._retry_attempts, company_name, result["status"],
                 )
 
+        # Location-enhanced retry
+        if search_hint and last_result["status"] in ("multiple", "not_found"):
+            hint_query = f"{company_name} {search_hint}"
+            logger.info("Retrying with location hint: '%s'", hint_query)
+            hint_result = await self._search_once(hint_query, match_name=company_name)
+            if hint_result["status"] in ("found", "multiple"):
+                return hint_result
+
         return last_result
 
-    async def _search_once(self, company_name: str) -> dict:
-        """Single search attempt."""
+    async def _search_once(self, company_name: str, match_name: str | None = None) -> dict:
+        """Single search attempt. If match_name is given, use it for exact-match comparison."""
         page = await self._context.new_page()
         try:
             # Navigate to homepage
@@ -243,7 +254,7 @@ class NorthdataClient:
                 return {"status": "found", "data": data}
             else:
                 # Check if the first result is an exact/close match
-                name_upper = company_name.upper().strip()
+                name_upper = (match_name or company_name).upper().strip()
                 for r in results:
                     if r["name"].upper().strip() == name_upper:
                         data = await self._follow_and_scrape(page, r)
@@ -282,8 +293,8 @@ class NorthdataClient:
                     continue
                 if any(skip in href for skip in _SKIP_HREFS):
                     continue
-                # Must look like a company page URL (contains encoded comma or registry ID)
-                if "%2C" not in href and "%20" not in href and "/Companies%20House" not in href:
+                # Must look like a company page URL (contains encoded comma, spaces, or plus signs)
+                if "%2C" not in href and "%20" not in href and "+" not in href and "/Companies%20House" not in href:
                     continue
 
                 text = await link.inner_text()
@@ -399,10 +410,15 @@ class NorthdataClient:
                     purpose_text = purpose_text[:497] + "..."
                 data["corporate_purpose"] = purpose_text
 
-            # Founded year from HISTORY section
-            year_match = re.search(r"(?:gegründet|founded|incorporated|Registration)\s*(?:in)?\s*(\d{4})", body_text, re.I)
+            # Founded year from HISTORY section — only match explicit founding keywords
+            year_match = re.search(r"(?:gegründet|founded|incorporated|Gründung)\s*(?:in)?\s*(\d{4})", body_text, re.I)
             if year_match:
                 data["founded_year"] = int(year_match.group(1))
+            else:
+                # Try: year before founding keyword (e.g. "1908 Gründung")
+                year_match = re.search(r"(\d{4})\s+(?:Gründung|founded|incorporated)", body_text, re.I)
+                if year_match:
+                    data["founded_year"] = int(year_match.group(1))
 
             # Parse structured tables
             tables = await page.query_selector_all("table")

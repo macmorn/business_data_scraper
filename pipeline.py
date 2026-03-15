@@ -125,6 +125,16 @@ async def run(country_filter: set[str] | None = None) -> None:
         run_extract(country_filter=country_filter)
     else:
         logger.info("Database already populated (%d companies), skipping PDF extraction", db.count_total())
+        # Recovery: if companies are stuck at 'new' (crash during Stage 1 routing),
+        # re-run routing to move them to pending_northdata.
+        stuck_at_new = db.count_at_stage("new")
+        if stuck_at_new > 0:
+            logger.warning(
+                "Found %d companies stuck at 'new' stage (likely from interrupted Stage 1). Re-routing...",
+                stuck_at_new,
+            )
+            from stages.s01_pdf_extract import _route_by_region
+            _route_by_region({}, country_filter=country_filter)
 
     # Log current state
     stats = db.get_stats()
@@ -141,6 +151,10 @@ async def run(country_filter: set[str] | None = None) -> None:
     # Stage 4: CEO identification and lookup
     from stages.s04_ceo_lookup import run as run_ceo
     await run_ceo()
+
+    # Stage 4b: Corporate structure traversal (follow holding/KG links)
+    from stages.s04b_structure import run as run_structure
+    await run_structure()
 
     # Stage 5: AI enrichment (disambiguation + career summaries)
     from stages.s05_ai_enrich import run as run_ai

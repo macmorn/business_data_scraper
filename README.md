@@ -73,6 +73,37 @@ PDF_LAYOUT=airbus_suppliers
 uv run python pipeline.py
 ```
 
+#### CLI Flags
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--input PATH` | `-i` | Path to source PDF (overrides `INPUT_PDF` in `.env`) |
+| `--output PATH` | `-o` | Path to output CSV (overrides `OUTPUT_CSV` in `.env`) |
+| `--layout NAME` | `-l` | PDF parsing layout (e.g. `airbus_suppliers`, `simple_name_list`) |
+| `--countries CODES` | `-c` | Comma-separated ISO country codes to include (e.g. `DE,FR,GB`). Only companies from these countries are kept. Default: all Northdata-covered EU countries |
+| `--db PATH` | | Path to SQLite database (overrides `DB_PATH` in `.env`) |
+| `--fresh` | | Delete existing database and start from scratch |
+| `--list-layouts` | | List available PDF layouts and exit |
+
+#### Examples
+
+```bash
+# Run with default settings
+uv run python pipeline.py
+
+# Only process German and French companies
+uv run python pipeline.py --countries DE,FR
+
+# Use a different PDF and layout
+uv run python pipeline.py --input input/other_list.pdf --layout simple_name_list
+
+# Wipe the database and re-run from scratch
+uv run python pipeline.py --fresh
+
+# See available PDF layouts
+uv run python pipeline.py --list-layouts
+```
+
 Monitor progress in a second terminal:
 
 ```bash

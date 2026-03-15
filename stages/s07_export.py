@@ -3,6 +3,11 @@
 Produces two files:
 1. Main CSV with all companies (Google Sheets compatible, UTF-8 BOM)
 2. Review CSV with only flagged companies needing manual review
+
+Resumability: Companies are marked 'done' BEFORE writing CSV files.
+If the script crashes after marking but before writing, re-running will
+find no pending companies and skip export. The CSV can be regenerated
+at any time from 'done' companies via db.get_all_for_export().
 """
 
 from __future__ import annotations
@@ -30,30 +35,24 @@ def run() -> None:
     logger.info("Stage 7: CSV Export (%d companies)", len(companies))
     logger.info("=" * 40)
 
-    # Build dataframe
+    # Mark all as done FIRST — prevents duplicates if crash occurs during CSV write.
+    # CSV can always be regenerated from 'done' companies.
+    for c in companies:
+        c.stage = STAGE_DONE
+        db.update_company(c)
+
+    # Build dataframe — dynamically map all CSV_COLUMNS from CompanyRecord
     rows = []
     for c in companies:
-        rows.append({
-            "company_name_original": c.name_original,
-            "matched_name": c.matched_name or c.name_original,
-            "country": c.country,
-            "legal_form": c.legal_form,
-            "status": c.status,
-            "founded_year": c.founded_year,
-            "address": c.address,
-            "employees_range": c.employees_range,
-            "revenue_range": c.revenue_range,
-            "last_accounts_year": c.last_accounts_year,
-            "officers": c.officers,
-            "ceo_name": c.ceo_name,
-            "ceo_linkedin_url": c.ceo_linkedin_url,
-            "ceo_current_title": c.ceo_current_title,
-            "ceo_career_summary": c.ceo_career_summary,
-            "ceo_confidence": c.ceo_confidence,
-            "data_sources_used": c.data_sources_used,
-            "confidence_score": c.confidence_score,
-            "needs_review_flag": c.needs_review_flag,
-        })
+        row = {}
+        for col in CSV_COLUMNS:
+            if col == "company_name_original":
+                row[col] = c.name_original
+            elif col == "matched_name":
+                row[col] = c.matched_name or c.name_original
+            else:
+                row[col] = getattr(c, col, None)
+        rows.append(row)
 
     df = pd.DataFrame(rows, columns=CSV_COLUMNS)
 
@@ -69,10 +68,5 @@ def run() -> None:
         review_path = output_path.parent / "needs_review.csv"
         review_df.to_csv(str(review_path), index=False, encoding="utf-8-sig")
         logger.info("Exported %d companies needing review to %s", len(review_df), review_path)
-
-    # Mark all as done
-    for c in companies:
-        c.stage = STAGE_DONE
-        db.update_company(c)
 
     logger.info("Stage 7 complete: %d companies exported", len(companies))
