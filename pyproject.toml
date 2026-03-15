@@ -1,0 +1,21 @@
+[project]
+name = "business-data-scraper"
+version = "0.1.0"
+description = "One-off pipeline to research EU companies from PDF sources"
+requires-python = ">=3.11"
+dependencies = [
+    "PyMuPDF>=1.23",
+    "playwright>=1.40",
+    "playwright-stealth>=1.0",
+    "httpx>=0.25",
+    "claude-agent-sdk",
+    "pandas>=2.1",
+    "python-dotenv>=1.0",
+    "beautifulsoup4>=4.12",
+]
+
+[project.scripts]
+run-pipeline = "pipeline:main"
+
+[tool.uv]
+dev-dependencies = []
