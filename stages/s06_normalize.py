@@ -11,6 +11,9 @@ import logging
 import re
 
 import db
+import cache
+import config
+from pathlib import Path
 from models import STAGE_PENDING_NORMALIZE, STAGE_PENDING_EXPORT
 from utils.logging_setup import ProgressTracker
 
@@ -275,6 +278,9 @@ def run() -> None:
                 company.needs_review_flag = True
 
             company.stage = STAGE_PENDING_EXPORT
+            # Write to shared enrichment cache
+            source_run = Path(config.INPUT_PDF).stem
+            cache.store(company, source_run)
             db.update_company(company)
             tracker.tick(company.name_original, f"confidence={company.confidence_score:.2f}" if company.confidence_score else "normalized")
 

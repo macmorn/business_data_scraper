@@ -56,6 +56,19 @@ class PDFLayout:
     # Only needed if they differ. Unmapped fields use their own name.
     field_mapping: dict[str, str] = field(default_factory=dict)
 
+    # Parse mode: "block" (repeating N-line blocks), "tabular" (fixed-width
+    # columns from pdftotext -layout), or "excel" (spreadsheet via openpyxl)
+    parse_mode: str = "block"
+
+    # Pass -layout flag to pdftotext for fixed-width column preservation
+    use_layout_flag: bool = False
+
+    # Number of leading PDF pages to skip (e.g. disclaimer/cover pages)
+    skip_pages: int = 0
+
+    # For Excel parse_mode: mapping from spreadsheet header → internal field name
+    header_mapping: dict[str, str] = field(default_factory=dict)
+
 
 # ============================================================
 # Layout: Airbus Approved Suppliers List
@@ -141,12 +154,90 @@ SIMPLE_NAME_LIST = PDFLayout(
 
 
 # ============================================================
+# Layout: A220 Program Approved Supplier List (tabular PDF)
+# ============================================================
+# Fixed-width columnar table extracted with pdftotext -layout.
+# Columns: SAP Code, Vendor Name, Address, City, State,
+#           Country/Region, Status, Class, General Limitation/Remarks
+# The _1.pdf variant adds: Specification Controlled, Description, Limitation
+# and has duplicate rows per SAP Code (one per specification).
+#
+# Key issues:
+#   - First 2 pages are disclaimer/cover → skip_pages=2
+#   - Multi-line wrapping for long vendor names and class values
+#   - Column boundaries parsed dynamically from header line
+# ============================================================
+
+A220_SUPPLIERS = PDFLayout(
+    name="a220_suppliers",
+    description="A220 Program Approved Supplier List (Airbus Canada, tabular format)",
+    parse_mode="tabular",
+    use_layout_flag=True,
+    skip_pages=2,
+    fields=[
+        FieldDef(name="sap_code", position=0, is_key=True),
+        FieldDef(name="vendor_name", position=1),
+        FieldDef(name="address", position=2),
+        FieldDef(name="city", position=3),
+        FieldDef(name="state", position=4),
+        FieldDef(name="country_region", position=5),
+        FieldDef(name="status", position=6),
+        FieldDef(name="supplier_class", position=7),
+        FieldDef(name="general_limitation", position=8),
+    ],
+    record_start_pattern=r"^\s*\d{4,6}\s+",
+    skip_patterns=[
+        "Airbus Canada Limited",
+        "A220 Approved Suppliers List",
+        "AIRBUS CANADA APPROVED",
+        "QMSF-09-02-04",
+        "Airbus Canada Property",
+    ],
+    skip_exact=[],
+    has_duplicate_rows=True,
+    dedup_collect_field="description",
+    field_mapping={
+        "vendor_name": "name_original",
+        "address": "address_street",
+        "city": "address_city",
+        "state": "address_state",
+        "country_region": "address_country",
+        "sap_code": "vendor_code",
+        "supplier_class": "product_group",
+    },
+)
+
+
+# ============================================================
+# Layout: Boeing Suppliers (Excel, 3 columns)
+# ============================================================
+# Simple spreadsheet: Company, Country, Category
+# No addresses, no identifier codes.
+# ============================================================
+
+BOEING_SUPPLIERS = PDFLayout(
+    name="boeing_suppliers",
+    description="Boeing Suppliers list (Excel, 3 columns: Company, Country, Category)",
+    parse_mode="excel",
+    fields=[],
+    header_mapping={
+        "Company": "name_original",
+        "Country": "address_country",
+        "Category": "product_group",
+    },
+    field_mapping={},
+)
+
+
+# ============================================================
 # Registry of all available layouts
 # ============================================================
 
 LAYOUTS: dict[str, PDFLayout] = {
     "airbus_suppliers": AIRBUS_SUPPLIERS,
     "simple_name_list": SIMPLE_NAME_LIST,
+    "a220_suppliers": A220_SUPPLIERS,
+    "boeing_suppliers": BOEING_SUPPLIERS,
 }
 
 # Default layout

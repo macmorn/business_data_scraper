@@ -65,7 +65,9 @@ def run() -> None:
     # Review CSV (only flagged companies)
     review_df = df[df["needs_review_flag"] == True]
     if not review_df.empty:
-        review_path = output_path.parent / "needs_review.csv"
+        # Derive review filename from output stem (e.g. "foo_enriched" → "foo_needs_review")
+        stem = output_path.stem.replace("_enriched", "")
+        review_path = output_path.parent / f"{stem}_needs_review.csv"
         review_df.to_csv(str(review_path), index=False, encoding="utf-8-sig")
         logger.info("Exported %d companies needing review to %s", len(review_df), review_path)
 

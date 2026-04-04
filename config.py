@@ -34,3 +34,13 @@ PDF_LAYOUT = os.environ.get("PDF_LAYOUT", "airbus_suppliers")
 
 # Pipeline
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+
+
+def derive_paths(input_path: str) -> tuple[str, str]:
+    """Derive output CSV and DB paths from input filename.
+
+    Example: "input/Boeing suppliers.xlsx" →
+        ("output/Boeing suppliers_enriched.csv", "data/Boeing suppliers.db")
+    """
+    stem = Path(input_path).stem
+    return f"output/{stem}_enriched.csv", f"data/{stem}.db"

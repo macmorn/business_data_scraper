@@ -8,6 +8,7 @@ Uses Claude API for:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -75,83 +76,75 @@ async def run() -> None:
                         await _disambiguate_company(company, raw["matches"], client, rate_limiter)
                         results["disambiguated"] += 1
 
-                # Task 2: CEO research or discovery
-                if company.ceo_name and company.ceo_current_title:
-                    # Known CEO — research career + LinkedIn
-                    try:
-                        ceo_data = await claude_ai.research_ceo(
-                            ceo_name=company.ceo_name,
-                            ceo_title=company.ceo_current_title,
-                            company_name=company.matched_name or company.name_original,
-                        )
-                        company.ceo_career_summary = ceo_data.get("career_summary")
-                        company.ceo_linkedin_url = ceo_data.get("linkedin_url")
-                        results["summary_generated"] += 1
-                    except Exception as e:
-                        logger.warning("CEO research failed for %s: %s", company.ceo_name, e)
-                else:
-                    # No CEO found — discover via web search
-                    try:
-                        ceo_data = await claude_ai.discover_ceo(
-                            company_name=company.matched_name or company.name_original,
-                            country=company.country,
-                            legal_form=company.legal_form,
-                        )
-                        if ceo_data and ceo_data.get("name"):
-                            company.ceo_name = ceo_data["name"]
-                            company.ceo_current_title = ceo_data.get("title", "Managing Director")
+                # Tasks 2 + 3 run in parallel (no shared writes between them)
+                cname = company.matched_name or company.name_original
+
+                async def _task_ceo():
+                    if company.ceo_name and company.ceo_current_title:
+                        try:
+                            ceo_data = await claude_ai.research_ceo(
+                                ceo_name=company.ceo_name,
+                                ceo_title=company.ceo_current_title,
+                                company_name=cname,
+                            )
                             company.ceo_career_summary = ceo_data.get("career_summary")
                             company.ceo_linkedin_url = ceo_data.get("linkedin_url")
-                            company.ceo_confidence = "medium"
-                            results["ceo_discovered"] += 1
-                            logger.info(
-                                "  Discovered CEO for '%s': %s",
-                                company.name_original, company.ceo_name,
+                            results["summary_generated"] += 1
+                        except Exception as e:
+                            logger.warning("CEO research failed for %s: %s", company.ceo_name, e)
+                    else:
+                        try:
+                            ceo_data = await claude_ai.discover_ceo(
+                                company_name=cname,
+                                country=company.country,
+                                legal_form=company.legal_form,
                             )
-                    except Exception as e:
-                        logger.warning(
-                            "CEO discovery failed for '%s': %s",
-                            company.name_original, e,
-                        )
+                            if ceo_data and ceo_data.get("name"):
+                                company.ceo_name = ceo_data["name"]
+                                company.ceo_current_title = ceo_data.get("title", "Managing Director")
+                                company.ceo_career_summary = ceo_data.get("career_summary")
+                                company.ceo_linkedin_url = ceo_data.get("linkedin_url")
+                                company.ceo_confidence = "medium"
+                                results["ceo_discovered"] += 1
+                                logger.info("  Discovered CEO for '%s': %s", company.name_original, company.ceo_name)
+                        except Exception as e:
+                            logger.warning("CEO discovery failed for '%s': %s", company.name_original, e)
 
-                # Task 3: Enrich missing revenue via web search
-                if not company.revenue:
-                    try:
-                        existing = {}
-                        if company.employees_count:
-                            existing["employees_count"] = company.employees_count
-                        if company.employees_range:
-                            existing["employees_range"] = company.employees_range
+                async def _task_financials():
+                    if not company.revenue:
+                        try:
+                            existing = {}
+                            if company.employees_count:
+                                existing["employees_count"] = company.employees_count
+                            if company.employees_range:
+                                existing["employees_range"] = company.employees_range
+                            fin_data = await claude_ai.enrich_missing_financials(
+                                company_name=cname,
+                                country=company.country,
+                                existing_data=existing if existing else None,
+                            )
+                            if fin_data.get("employees_count") and not company.employees_count:
+                                company.employees_count = fin_data["employees_count"]
+                                if not company.employees_range:
+                                    company.employees_range = fin_data["employees_count"]
+                            if fin_data.get("revenue"):
+                                company.revenue = fin_data["revenue"]
+                                if not company.revenue_range:
+                                    company.revenue_range = fin_data["revenue"]
+                            if fin_data.get("total_assets"):
+                                company.total_assets = fin_data["total_assets"]
+                            _append_source(company, "claude_web")
+                            results["financials_enriched"] += 1
+                        except Exception as e:
+                            logger.warning("Financial enrichment failed for '%s': %s", company.name_original, e)
 
-                        fin_data = await claude_ai.enrich_missing_financials(
-                            company_name=company.matched_name or company.name_original,
-                            country=company.country,
-                            existing_data=existing if existing else None,
-                        )
-                        if fin_data.get("employees_count") and not company.employees_count:
-                            company.employees_count = fin_data["employees_count"]
-                            if not company.employees_range:
-                                company.employees_range = fin_data["employees_count"]
-                        if fin_data.get("revenue"):
-                            company.revenue = fin_data["revenue"]
-                            if not company.revenue_range:
-                                company.revenue_range = fin_data["revenue"]
-                        if fin_data.get("total_assets"):
-                            company.total_assets = fin_data["total_assets"]
+                await asyncio.gather(_task_ceo(), _task_financials())
 
-                        _append_source(company, "claude_web")
-                        results["financials_enriched"] += 1
-                    except Exception as e:
-                        logger.warning(
-                            "Financial enrichment failed for '%s': %s",
-                            company.name_original, e,
-                        )
-
-                # Task 4: Estimate employee count if still missing
+                # Task 4: Estimate employee count if still missing after Task 3
                 if not company.employees_count:
                     try:
                         emp_count = await claude_ai.estimate_employee_count(
-                            company_name=company.matched_name or company.name_original,
+                            company_name=cname,
                             country=company.country,
                             revenue=company.revenue,
                         )
@@ -160,21 +153,15 @@ async def run() -> None:
                             if not company.employees_range:
                                 company.employees_range = emp_count
                             _append_source(company, "claude_web")
-                            logger.info(
-                                "  Estimated employees for '%s': %s",
-                                company.name_original, emp_count,
-                            )
+                            logger.info("  Estimated employees for '%s': %s", company.name_original, emp_count)
                     except Exception as e:
-                        logger.warning(
-                            "Employee estimation failed for '%s': %s",
-                            company.name_original, e,
-                        )
+                        logger.warning("Employee estimation failed for '%s': %s", company.name_original, e)
 
-                # Task 5: Generate corporate structure summary if missing
+                # Task 5: Corporate structure summary (after Tasks 2-4 so it has latest data)
                 if not company.corporate_structure_summary:
                     try:
                         summary = await claude_ai.summarize_corporate_structure(
-                            company_name=company.matched_name or company.name_original,
+                            company_name=cname,
                             legal_form=company.legal_form,
                             country=company.country,
                             revenue=company.revenue,
@@ -185,10 +172,7 @@ async def run() -> None:
                         if summary:
                             company.corporate_structure_summary = summary
                     except Exception as e:
-                        logger.warning(
-                            "Structure summary failed for '%s': %s",
-                            company.name_original, e,
-                        )
+                        logger.warning("Structure summary failed for '%s': %s", company.name_original, e)
 
                 company.stage = STAGE_PENDING_NORMALIZE
                 db.update_company(company)

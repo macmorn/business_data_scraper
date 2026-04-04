@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 # Semaphore to limit concurrent Claude calls
 _semaphore = asyncio.Semaphore(5)
 
+# Timeouts for Claude calls (seconds)
+_TIMEOUT_WEB = 120    # web-search enabled — network round-trips can be slow
+_TIMEOUT_PLAIN = 60   # text generation only
+
 
 async def _ask_claude(
     prompt: str,
@@ -36,7 +40,7 @@ async def _ask_claude(
     """Send a prompt to Claude via the Agent SDK and return the text result.
 
     Args:
-        use_web: If True, enables WebSearch and WebFetch tools with up to 3
+        use_web: If True, enables WebSearch and WebFetch tools with up to 6
                  turns so Claude can research online before responding.
     """
     options = ClaudeAgentOptions(
@@ -48,11 +52,22 @@ async def _ask_claude(
     if output_format:
         options.output_format = output_format
 
+    timeout = _TIMEOUT_WEB if use_web else _TIMEOUT_PLAIN
+
     async with _semaphore:
         result = ""
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, ResultMessage):
-                result = message.result
+
+        async def _collect() -> None:
+            nonlocal result
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, ResultMessage):
+                    result = message.result
+
+        try:
+            await asyncio.wait_for(_collect(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Claude call timed out after %ds (use_web=%s)", timeout, use_web)
+
         return result
 
 

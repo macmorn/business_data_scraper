@@ -21,7 +21,12 @@ from pdf_layouts import LAYOUTS, DEFAULT_LAYOUT, PDFLayout
 logger = logging.getLogger(__name__)
 
 
-def extract_text_pdftotext(pdf_path: str) -> str:
+def extract_text_pdftotext(
+    pdf_path: str,
+    *,
+    use_layout: bool = False,
+    skip_pages: int = 0,
+) -> str:
     """Extract text from PDF using pdftotext (poppler-utils).
 
     This handles custom font encodings that break pdfplumber/PyMuPDF.
@@ -31,8 +36,15 @@ def extract_text_pdftotext(pdf_path: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
+    cmd = ["pdftotext"]
+    if use_layout:
+        cmd.append("-layout")
+    if skip_pages > 0:
+        cmd.extend(["-f", str(skip_pages + 1)])
+    cmd.extend([str(path), "-"])
+
     result = subprocess.run(
-        ["pdftotext", str(path), "-"],
+        cmd,
         capture_output=True, text=True, timeout=120,
     )
     if result.returncode != 0:
@@ -58,10 +70,17 @@ def extract_text_pymupdf(pdf_path: str) -> str:
     return text
 
 
-def extract_text(pdf_path: str) -> str:
+def extract_text(
+    pdf_path: str,
+    *,
+    use_layout: bool = False,
+    skip_pages: int = 0,
+) -> str:
     """Extract text from PDF, trying pdftotext first, then PyMuPDF."""
     try:
-        return extract_text_pdftotext(pdf_path)
+        return extract_text_pdftotext(
+            pdf_path, use_layout=use_layout, skip_pages=skip_pages,
+        )
     except (FileNotFoundError, RuntimeError) as e:
         if "PDF not found" in str(e):
             raise
@@ -70,22 +89,28 @@ def extract_text(pdf_path: str) -> str:
 
 
 def clean_lines(text: str, layout: PDFLayout) -> list[str]:
-    """Strip blank lines and filter out header/footer/boilerplate lines."""
+    """Strip blank lines and filter out header/footer/boilerplate lines.
+
+    For tabular layouts (parse_mode="tabular"), leading whitespace is
+    preserved since column positions depend on character offsets.
+    """
+    preserve_indent = layout.parse_mode == "tabular"
     lines = []
     for raw_line in text.split("\n"):
-        line = raw_line.strip()
-        if not line:
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
             continue
         # Skip by substring match
-        if any(pat in line for pat in layout.skip_patterns):
+        if any(pat in stripped for pat in layout.skip_patterns):
             continue
         # Skip exact matches
-        if line in layout.skip_exact:
+        if stripped in layout.skip_exact:
             continue
         # Skip standalone page numbers
-        if re.match(r"^\d{1,2}$", line):
+        if re.match(r"^\d{1,2}$", stripped):
             continue
-        lines.append(line)
+        lines.append(line if preserve_indent else stripped)
     return lines
 
 
@@ -122,6 +147,270 @@ def parse_records(lines: list[str], layout: PDFLayout) -> list[dict]:
         i += fields_per_record
 
     logger.info("Parsed %d raw records from PDF", len(records))
+    return records
+
+
+# Used to detect whether a line is the main header line
+_A220_HEADER_DETECT = ["SAP Code", "Vendor Name", "Address"]
+
+# Column display names and their internal field names (in order).
+# "Country/Region" is inferred between State and Status.
+_A220_COLUMNS: list[tuple[str, str]] = [
+    ("SAP Code",           "sap_code"),
+    ("Vendor Name",        "vendor_name"),
+    ("Address",            "address"),
+    ("City",               "city"),
+    ("State",              "state"),
+    # Country/Region inserted dynamically
+    ("Status",             "status"),
+    ("Class",              "supplier_class"),
+    ("General Limitation", "general_limitation"),
+]
+
+
+def _parse_header_columns(header_line: str) -> list[tuple[str, int]]:
+    """Extract (field_name, position) pairs from a header line.
+
+    Inserts country_region between state and status using the midpoint.
+    """
+    cols: list[tuple[str, int]] = []
+    for display, field in _A220_COLUMNS:
+        pos = header_line.find(display)
+        if pos == -1 and "General" in display:
+            pos = header_line.find("General")
+        if pos != -1:
+            cols.append((field, pos))
+
+    cols.sort(key=lambda x: x[1])
+
+    # Insert country_region between state and status
+    state_idx = next((i for i, (n, _) in enumerate(cols) if n == "state"), None)
+    status_idx = next((i for i, (n, _) in enumerate(cols) if n == "status"), None)
+    if state_idx is not None and status_idx is not None:
+        state_pos = cols[state_idx][1]
+        status_pos = cols[status_idx][1]
+        country_pos = state_pos + (status_pos - state_pos) // 3
+        cols.insert(status_idx, ("country_region", country_pos))
+
+    return cols
+
+
+def _find_text_segments(line: str) -> list[tuple[int, str]]:
+    """Find all contiguous text segments in a line, separated by 2+ spaces.
+
+    Returns list of (start_position, text) tuples.
+    """
+    segments = []
+    i = 0
+    n = len(line)
+    while i < n:
+        # Skip whitespace
+        while i < n and line[i] == " ":
+            i += 1
+        if i >= n:
+            break
+        start = i
+        # Consume text (including single spaces within words)
+        while i < n:
+            if line[i] == " ":
+                # Check if this is a multi-space gap (2+)
+                j = i
+                while j < n and line[j] == " ":
+                    j += 1
+                if j - i >= 2:
+                    break  # column separator
+                i = j  # single space, continue
+            else:
+                i += 1
+        segments.append((start, line[start:i].strip()))
+    return segments
+
+
+def _assign_segments_to_columns(
+    segments: list[tuple[int, str]],
+    col_positions: list[tuple[str, int]],
+) -> dict[str, str]:
+    """Map text segments to columns by proximity to header positions."""
+    record: dict[str, str] = {name: "" for name, _ in col_positions}
+
+    for seg_pos, seg_text in segments:
+        # Find the nearest column (by start position)
+        best_col = None
+        best_dist = float("inf")
+        for col_name, col_pos in col_positions:
+            dist = abs(seg_pos - col_pos)
+            if dist < best_dist:
+                best_dist = dist
+                best_col = col_name
+        if best_col is not None:
+            if record[best_col]:
+                record[best_col] += " " + seg_text
+            else:
+                record[best_col] = seg_text
+
+    return record
+
+
+def parse_tabular_records(
+    lines: list[str],
+    layout: PDFLayout,
+    raw_text_lines: list[str] | None = None,
+) -> list[dict]:
+    """Parse fixed-width columnar output from pdftotext -layout.
+
+    Uses per-page header recalibration: each time a header line is found,
+    column positions are re-extracted. Text segments on each data line are
+    mapped to columns by proximity to the header positions.
+
+    Args:
+        lines: Cleaned lines (skip_patterns already applied).
+        layout: The active PDF layout.
+        raw_text_lines: Uncleaned lines from pdftotext (unused, kept for API compat).
+    """
+    record_re = re.compile(layout.record_start_pattern)
+    col_positions: list[tuple[str, int]] | None = None
+    records: list[dict] = []
+    pre_record_buffer: list[list[tuple[int, str]]] = []
+
+    for line in lines:
+        # Detect header line — recalibrate column positions each time
+        if all(h in line for h in _A220_HEADER_DETECT):
+            col_positions = _parse_header_columns(line)
+            pre_record_buffer.clear()
+            logger.debug(
+                "Header columns: %s",
+                [(n, p) for n, p in col_positions],
+            )
+            continue
+
+        if col_positions is None:
+            continue
+
+        # Skip empty lines
+        if not line.strip():
+            continue
+
+        # Parse text segments from this line
+        segments = _find_text_segments(line)
+        if not segments:
+            continue
+
+        if record_re.match(line):
+            # New record — check if the last buffered pre-record line has
+            # vendor_name-only text (wrapping above the SAP code line).
+            pre_vendor_parts = []
+            if pre_record_buffer:
+                # Only consider the immediately preceding continuation line(s)
+                # that have text ONLY in the vendor_name column
+                for buf in pre_record_buffer:
+                    buf_assigned = _assign_segments_to_columns(buf, col_positions)
+                    vn = buf_assigned.get("vendor_name", "")
+                    # Only steal if this line has vendor_name text and
+                    # no text in position-sensitive columns (sap, address, city, etc.)
+                    other_fields = any(
+                        buf_assigned.get(f, "")
+                        for f in ("sap_code", "address", "city", "status")
+                    )
+                    if vn and not other_fields:
+                        pre_vendor_parts.append(vn)
+            pre_record_buffer.clear()
+
+            record = _assign_segments_to_columns(segments, col_positions)
+
+            if pre_vendor_parts:
+                existing_vn = record.get("vendor_name", "")
+                full_vn = " ".join(pre_vendor_parts)
+                if existing_vn:
+                    full_vn += " " + existing_vn
+                record["vendor_name"] = full_vn
+
+                # Remove the stolen vendor text from the PREVIOUS record
+                if records:
+                    prev = records[-1]
+                    for part in pre_vendor_parts:
+                        pv = prev.get("vendor_name", "")
+                        if pv.endswith(" " + part):
+                            prev["vendor_name"] = pv[: -(len(part) + 1)]
+                        elif pv.endswith(part):
+                            prev["vendor_name"] = pv[: -len(part)]
+
+            records.append(record)
+        elif records:
+            # Continuation line — merge into previous record
+            continuation = _assign_segments_to_columns(segments, col_positions)
+            prev = records[-1]
+            for key, val in continuation.items():
+                if val:
+                    existing = prev.get(key, "")
+                    if existing:
+                        prev[key] = existing + " " + val
+                    else:
+                        prev[key] = val
+            # Buffer this line in case it's a pre-record wrap for the NEXT record
+            pre_record_buffer.append(segments)
+        else:
+            # Pre-record continuation (before any SAP code seen on this page)
+            pre_record_buffer.append(segments)
+
+    # Post-process: fix multi-word country names split across state/country columns.
+    # If "state" doesn't look like a 2-letter state/province code, it's likely the
+    # first word of the country name (e.g. "United" from "United Kingdom").
+    for record in records:
+        state = record.get("state", "").strip()
+        country = record.get("country_region", "").strip()
+        if state and not re.match(r"^[A-Z]{2}$", state):
+            # Merge state into country and clear state
+            record["country_region"] = (state + " " + country).strip()
+            record["state"] = ""
+
+    logger.info("Parsed %d raw records from tabular PDF", len(records))
+    return records
+
+
+def extract_from_excel(file_path: str, layout: PDFLayout) -> list[dict]:
+    """Extract records from an Excel file using openpyxl.
+
+    Maps spreadsheet column headers to internal field names via
+    layout.header_mapping.
+    """
+    import openpyxl
+
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Excel file not found: {file_path}")
+
+    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    if not rows:
+        logger.warning("Excel file %s is empty", path.name)
+        return []
+
+    # First row is headers
+    headers = [str(h).strip() if h else "" for h in rows[0]]
+    # Map header names to internal field names
+    col_map: dict[int, str] = {}
+    for i, header in enumerate(headers):
+        if header in layout.header_mapping:
+            col_map[i] = layout.header_mapping[header]
+
+    if not col_map:
+        logger.error("No matching headers found in %s. Headers: %s", path.name, headers)
+        return []
+
+    records = []
+    for row in rows[1:]:
+        record = {}
+        for col_idx, field_name in col_map.items():
+            val = row[col_idx] if col_idx < len(row) else None
+            record[field_name] = str(val).strip() if val is not None else ""
+        if any(record.values()):
+            records.append(record)
+
+    logger.info("Extracted %d records from Excel %s", len(records), path.name)
     return records
 
 
@@ -197,7 +486,7 @@ def build_address(record: dict) -> str | None:
 
 def get_layout() -> PDFLayout:
     """Get the active PDF layout from config."""
-    layout_name = os.environ.get("PDF_LAYOUT", DEFAULT_LAYOUT)
+    layout_name = config.PDF_LAYOUT
     if layout_name not in LAYOUTS:
         logger.warning("Unknown layout '%s', falling back to '%s'", layout_name, DEFAULT_LAYOUT)
         layout_name = DEFAULT_LAYOUT
@@ -207,7 +496,7 @@ def get_layout() -> PDFLayout:
 
 
 def run(country_filter: set[str] | None = None) -> None:
-    """Execute PDF extraction stage.
+    """Execute data extraction stage (PDF or Excel).
 
     Args:
         country_filter: If provided, only keep companies from these ISO country
@@ -215,22 +504,35 @@ def run(country_filter: set[str] | None = None) -> None:
                         NORTHDATA_COUNTRIES set.
     """
     logger.info("=" * 40)
-    logger.info("Stage 1: PDF Extraction")
+    logger.info("Stage 1: Data Extraction")
     logger.info("=" * 40)
 
     layout = get_layout()
-    pdf_path = config.INPUT_PDF
+    input_path = config.INPUT_PDF
 
-    # Extract text
-    text = extract_text(pdf_path)
+    if layout.parse_mode == "excel" or input_path.endswith((".xlsx", ".xls")):
+        # Excel path — no text extraction needed
+        records = extract_from_excel(input_path, layout)
+        # header_mapping already produces internal field names, so skip
+        # apply_field_mapping (it would double-map)
+        records = deduplicate_records(records, layout)
+    else:
+        # PDF path
+        text = extract_text(
+            input_path,
+            use_layout=layout.use_layout_flag,
+            skip_pages=layout.skip_pages,
+        )
+        lines = clean_lines(text, layout)
+        logger.info("Cleaned text: %d non-empty lines", len(lines))
 
-    # Clean and parse
-    lines = clean_lines(text, layout)
-    logger.info("Cleaned text: %d non-empty lines", len(lines))
-
-    records = parse_records(lines, layout)
-    records = deduplicate_records(records, layout)
-    records = apply_field_mapping(records, layout)
+        if layout.parse_mode == "tabular":
+            raw_lines = text.split("\n")
+            records = parse_tabular_records(lines, layout, raw_text_lines=raw_lines)
+        else:
+            records = parse_records(lines, layout)
+        records = deduplicate_records(records, layout)
+        records = apply_field_mapping(records, layout)
 
     # Load into database
     names = []
@@ -362,6 +664,19 @@ def _apply_extra_data(extra_data: dict[str, dict]) -> None:
 
 def _normalize_country(country_raw: str) -> str | None:
     """Normalize country name to ISO 3166-1 alpha-2 code."""
+    # Pre-clean common noise from tabular PDF parsing
+    cleaned = country_raw.strip()
+    # Strip leading digits/spaces (page numbers merged with country)
+    cleaned = re.sub(r"^\d+\s+", "", cleaned)
+    # Strip trailing noise like "United", "Country/ Region"
+    cleaned = re.sub(r"\s+Country/?.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+United$", "", cleaned)
+    # Handle reversed word order
+    cleaned = re.sub(r"^United\s+", "", cleaned) if "Kingdom" not in cleaned else cleaned
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return None
+
     mapping = {
         "germany": "DE", "deutschland": "DE",
         "france": "FR", "frankreich": "FR",
@@ -397,6 +712,12 @@ def _normalize_country(country_raw: str) -> str | None:
         "taiwan": "TW",
         "turkey": "TR", "türkei": "TR",
         "israel": "IL",
+        "united kingdom": "GB", "kingdom united": "GB", "kingdom": "GB",
+        "united states": "US", "usa united": "US", "states united": "US",
+        "south korea": "KR", "korea south": "KR",
+        "republic czech": "CZ",
+        "republic of korea": "KR",
+        "kong hong": "HK", "hong kong": "HK",
     }
-    key = country_raw.strip().lower()
-    return mapping.get(key, country_raw.strip()[:2].upper())
+    key = cleaned.lower()
+    return mapping.get(key, cleaned[:2].upper())

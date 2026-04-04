@@ -12,6 +12,8 @@ dependencies = [
     "pandas>=2.1",
     "python-dotenv>=1.0",
     "beautifulsoup4>=4.12",
+    "openpyxl>=3.1.5",
+    "pgeocode>=0.5.0",
 ]
 
 [project.scripts]
