@@ -141,113 +141,74 @@ async def _enrich_company(
             await _disambiguate_company(company, raw["matches"], clie, rate_limiter)
             results["disambiguated"] += 1
 
-    # Tasks 2 + 3 run in parallel (no shared writes between them)
+    # Single merged enrichment call: CEO + financials + business description.
+    # Replaces the former research_ceo/discover_ceo + enrich_missing_financials
+    # + estimate_employee_count + summarize_corporate_structure chain.
     cname = company.matched_name or company.name_original
 
-    async def _task_ceo():
-        if company.ceo_name and company.ceo_current_title:
-            try:
-                ceo_data = await claude_ai.research_ceo(
-                    ceo_name=company.ceo_name,
-                    ceo_title=company.ceo_current_title,
-                    company_name=cname,
-                )
-                company.ceo_career_summary = ceo_data.get("career_summary")
-                company.ceo_linkedin_url = ceo_data.get("linkedin_url")
-                results["summary_generated"] += 1
-            except claude_ai.ClaudeUsageLimitError:
-                raise
-            except Exception as e:
-                logger.warning("CEO research failed for %s: %s", company.ceo_name, e)
-        else:
-            try:
-                ceo_data = await claude_ai.discover_ceo(
-                    company_name=cname,
-                    country=company.country,
-                    legal_form=company.legal_form,
-                )
-                if ceo_data and ceo_data.get("name"):
-                    company.ceo_name = ceo_data["name"]
-                    company.ceo_current_title = ceo_data.get("title", "Managing Director")
-                    company.ceo_career_summary = ceo_data.get("career_summary")
-                    company.ceo_linkedin_url = ceo_data.get("linkedin_url")
-                    company.ceo_confidence = "medium"
-                    results["ceo_discovered"] += 1
-                    logger.info("  Discovered CEO for '%s': %s", company.name_original, company.ceo_name)
-            except claude_ai.ClaudeUsageLimitError:
-                raise
-            except Exception as e:
-                logger.warning("CEO discovery failed for '%s': %s", company.name_original, e)
+    had_ceo_name = bool(company.ceo_name)
 
-    async def _task_financials():
-        if not company.revenue:
-            try:
-                existing = {}
-                if company.employees_count:
-                    existing["employees_count"] = company.employees_count
-                if company.employees_range:
-                    existing["employees_range"] = company.employees_range
-                fin_data = await claude_ai.enrich_missing_financials(
-                    company_name=cname,
-                    country=company.country,
-                    existing_data=existing if existing else None,
-                )
-                if fin_data.get("employees_count") and not company.employees_count:
-                    company.employees_count = fin_data["employees_count"]
-                    if not company.employees_range:
-                        company.employees_range = fin_data["employees_count"]
-                if fin_data.get("revenue"):
-                    company.revenue = fin_data["revenue"]
-                    if not company.revenue_range:
-                        company.revenue_range = fin_data["revenue"]
-                if fin_data.get("total_assets"):
-                    company.total_assets = fin_data["total_assets"]
-                _append_source(company, "claude_web")
-                results["financials_enriched"] += 1
-            except claude_ai.ClaudeUsageLimitError:
-                raise
-            except Exception as e:
-                logger.warning("Financial enrichment failed for '%s': %s", company.name_original, e)
+    try:
+        data = await claude_ai.enrich_company(
+            company_name=cname,
+            country=company.country,
+            legal_form=company.legal_form,
+            known_ceo_name=company.ceo_name,
+            known_ceo_title=company.ceo_current_title,
+            known_revenue=company.revenue,
+            known_employees=company.employees_count or company.employees_range,
+        )
+    except claude_ai.ClaudeUsageLimitError:
+        raise
+    except Exception as e:
+        logger.warning("Merged enrichment failed for '%s': %s", company.name_original, e)
+        return
 
-    await asyncio.gather(_task_ceo(), _task_financials())
+    ceo = data.get("ceo") or {}
+    fin = data.get("financials") or {}
 
-    # Task 4: Estimate employee count if still missing after Task 3
-    if not company.employees_count:
-        try:
-            emp_count = await claude_ai.estimate_employee_count(
-                company_name=cname,
-                country=company.country,
-                revenue=company.revenue,
-            )
-            if emp_count:
-                company.employees_count = emp_count
-                if not company.employees_range:
-                    company.employees_range = emp_count
-                _append_source(company, "claude_web")
-                logger.info("  Estimated employees for '%s': %s", company.name_original, emp_count)
-        except claude_ai.ClaudeUsageLimitError:
-            raise
-        except Exception as e:
-            logger.warning("Employee estimation failed for '%s': %s", company.name_original, e)
+    # --- Apply CEO ---
+    if had_ceo_name:
+        # We already had a name (from registry/structure stages): only enrich.
+        if ceo.get("career_summary"):
+            company.ceo_career_summary = ceo["career_summary"]
+        if ceo.get("linkedin_url"):
+            company.ceo_linkedin_url = ceo["linkedin_url"]
+        if company.ceo_career_summary:
+            results["summary_generated"] += 1
+    elif ceo.get("name"):
+        # Newly discovered CEO.
+        company.ceo_name = ceo["name"]
+        company.ceo_current_title = ceo.get("title") or "Managing Director"
+        company.ceo_career_summary = ceo.get("career_summary")
+        company.ceo_linkedin_url = ceo.get("linkedin_url")
+        company.ceo_confidence = "medium"
+        results["ceo_discovered"] += 1
+        logger.info("  Discovered CEO for '%s': %s", company.name_original, company.ceo_name)
 
-    # Task 5: Corporate structure summary (after Tasks 2-4 so it has latest data)
-    if not company.corporate_structure_summary:
-        try:
-            summary = await claude_ai.summarize_corporate_structure(
-                company_name=cname,
-                legal_form=company.legal_form,
-                country=company.country,
-                revenue=company.revenue,
-                employees=company.employees_count or company.employees_range,
-                ceo_name=company.ceo_name,
-                ceo_title=company.ceo_current_title,
-            )
-            if summary:
-                company.corporate_structure_summary = summary
-        except claude_ai.ClaudeUsageLimitError:
-            raise
-        except Exception as e:
-            logger.warning("Structure summary failed for '%s': %s", company.name_original, e)
+    # --- Apply financials (only fill gaps) ---
+    filled_financials = False
+    if fin.get("revenue") and not company.revenue:
+        company.revenue = fin["revenue"]
+        if not company.revenue_range:
+            company.revenue_range = fin["revenue"]
+        filled_financials = True
+    if fin.get("employees_count") and not company.employees_count:
+        company.employees_count = fin["employees_count"]
+        if not company.employees_range:
+            company.employees_range = fin["employees_count"]
+        filled_financials = True
+    if fin.get("total_assets") and not company.total_assets:
+        company.total_assets = fin["total_assets"]
+        filled_financials = True
+    if filled_financials:
+        _append_source(company, "claude_web")
+        results["financials_enriched"] += 1
+
+    # --- Apply business description -> corporate structure summary (gap-fill) ---
+    # S04b may have already written a richer related-entity summary; don't clobber it.
+    if not company.corporate_structure_summary and data.get("business_description"):
+        company.corporate_structure_summary = data["business_description"]
 
 
 async def _disambiguate_company(
