@@ -217,6 +217,43 @@ async def _enrich_company(
     if not company.corporate_structure_summary and data.get("business_description"):
         company.corporate_structure_summary = data["business_description"]
 
+    # --- Preserve the raw Claude output (don't lose it on parse failure) ---
+    raw = (data.get("raw") or "").strip()
+    if raw:
+        try:
+            envelope = json.loads(company.northdata_raw) if company.northdata_raw else {}
+            if not isinstance(envelope, dict):
+                envelope = {"_prev": company.northdata_raw}
+        except (json.JSONDecodeError, TypeError):
+            envelope = {"_prev": company.northdata_raw}
+        envelope["claude_enrich_raw"] = data.get("raw")
+        company.northdata_raw = json.dumps(envelope, ensure_ascii=False)
+
+    # --- Flag genuinely-empty enrichment for manual review ---
+    # "Empty" = this call produced no usable data AND there was no raw prose to
+    # salvage. A company that already had registry data (CEO/revenue from
+    # Northdata) is NOT flagged — only ones left with nothing.
+    produced_nothing = (
+        not data.get("business_description")
+        and not (data.get("ceo") or {}).get("name")
+        and not (data.get("ceo") or {}).get("career_summary")
+        and not any((data.get("financials") or {}).values())
+        and not raw
+    )
+    has_any_real_data = bool(
+        (company.corporate_structure_summary or "").strip()
+        or (company.ceo_name or "").strip()
+        or (company.revenue or "").strip()
+        or (company.employees_count or "").strip()
+    )
+    if produced_nothing and not has_any_real_data:
+        company.needs_review_flag = True
+        company.error = "enrichment_empty_response"
+        logger.warning(
+            "  Empty AI response for '%s' — flagged for review (no usable data)",
+            company.name_original,
+        )
+
 
 async def _disambiguate_company(
     company,
