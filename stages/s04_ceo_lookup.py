@@ -63,7 +63,14 @@ async def run() -> None:
     for company in companies:
         try:
             ceo = _extract_ceo_from_officers(company.officers)
-            if ceo:
+            if company.ceo_name:
+                # CEO was seeded from the input list — preserve it rather than
+                # overwriting with the officers-derived match.
+                if not company.ceo_confidence:
+                    company.ceo_confidence = "seeded"
+                results["from_officers"] += 1
+                tracker.tick(company.name_original, f"CEO (seeded): {company.ceo_name}")
+            elif ceo:
                 company.ceo_name = ceo["name"]
                 company.ceo_current_title = ceo["role"]
                 # High confidence for primary CEO roles, medium for fallback roles

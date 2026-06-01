@@ -23,6 +23,12 @@ from utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
+
+class ClaudeTimeoutError(Exception):
+    """Raised when a Claude Agent SDK call exceeds its timeout."""
+    pass
+
+
 # Semaphore to limit concurrent Claude calls
 _semaphore = asyncio.Semaphore(5)
 
@@ -56,23 +62,42 @@ async def _ask_claude(
 
     async with _semaphore:
         result = ""
+        gen = query(prompt=prompt, options=options)
 
         async def _collect() -> None:
             nonlocal result
-            async for message in query(prompt=prompt, options=options):
+            async for message in gen:
                 if isinstance(message, ResultMessage):
                     result = message.result
 
         try:
             await asyncio.wait_for(_collect(), timeout=timeout)
         except asyncio.TimeoutError:
-            logger.warning("Claude call timed out after %ds (use_web=%s)", timeout, use_web)
+            logger.warning(
+                "Claude call timed out after %ds (use_web=%s), closing generator",
+                timeout, use_web,
+            )
+            # Explicitly close the async generator to kill the subprocess
+            try:
+                await asyncio.wait_for(gen.aclose(), timeout=10)
+            except (asyncio.TimeoutError, Exception):
+                logger.warning("Generator aclose() also timed out or errored")
+            raise ClaudeTimeoutError(
+                f"Claude call timed out after {timeout}s (use_web={use_web})"
+            )
+        except asyncio.CancelledError:
+            # If our own task is cancelled externally, clean up the generator too
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+            raise
 
         return result
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def resolve_company_name(
     company_name: str,
@@ -119,7 +144,7 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 
 
 @with_retry(
-    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def disambiguate(
     original_name: str,
@@ -174,7 +199,7 @@ If none are a good match, use index: -1."""
 
 
 @with_retry(
-    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def generate_career_summary(
     ceo_name: str,
@@ -245,7 +270,7 @@ def _try_parse_json(text: str) -> dict | None:
 
 
 @with_retry(
-    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def research_ceo(
     ceo_name: str,
@@ -296,7 +321,7 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 
 
 @with_retry(
-    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def extract_ceo_from_text(
     company_name: str,
@@ -340,7 +365,7 @@ If no leader can be identified, use null values."""
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def discover_ceo(
     company_name: str,
@@ -396,7 +421,7 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def enrich_missing_financials(
     company_name: str,
@@ -456,7 +481,7 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def estimate_employee_count(
     company_name: str,
@@ -507,7 +532,7 @@ You MUST respond with ONLY a JSON object (no markdown, no explanation):
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError)
+    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
 async def summarize_corporate_structure(
     company_name: str,

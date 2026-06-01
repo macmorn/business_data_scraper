@@ -62,6 +62,11 @@ def run() -> None:
     df.to_csv(str(output_path), index=False, encoding="utf-8-sig")
     logger.info("Exported %d companies to %s", len(df), output_path)
 
+    # Excel export
+    xlsx_path = output_path.with_suffix(".xlsx")
+    df.to_excel(str(xlsx_path), index=False, engine="openpyxl")
+    logger.info("Exported %d companies to %s", len(df), xlsx_path)
+
     # Review CSV (only flagged companies)
     review_df = df[df["needs_review_flag"] == True]
     if not review_df.empty:

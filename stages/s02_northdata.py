@@ -119,9 +119,12 @@ def apply_company_data(company, data: dict) -> None:
     company.matched_name = data.get("name") or company.name_original
     company.legal_form = data.get("legal_form")
     company.status = data.get("status")
-    company.address = data.get("address")
+    # Coalesce fields that may have been seeded from the input list: Northdata
+    # wins when it returns a value, otherwise the seeded value is preserved
+    # (data.get() returning None would otherwise blank it out).
+    company.address = data.get("address") or company.address
     company.founded_year = data.get("founded_year")
-    company.employees_range = data.get("employees_range")
+    company.employees_range = data.get("employees_range") or company.employees_range
     company.revenue_range = data.get("revenue_range")
     company.last_accounts_year = data.get("last_accounts_year")
     company.northdata_url = data.get("url")
@@ -138,7 +141,7 @@ def apply_company_data(company, data: dict) -> None:
     company.total_assets = data.get("total_assets")
     company.equity = data.get("equity")
     company.equity_ratio = data.get("equity_ratio")
-    company.employees_count = data.get("employees_count")
+    company.employees_count = data.get("employees_count") or company.employees_count
     company.return_on_sales = data.get("return_on_sales")
     company.cost_of_materials = data.get("cost_of_materials")
     company.wages_and_salaries = data.get("wages_and_salaries")
@@ -158,9 +161,9 @@ def apply_company_data(company, data: dict) -> None:
     if officers:
         company.officers = json.dumps(officers, ensure_ascii=False)
 
-    # Try to extract country from address
+    # Try to extract country from address (keep any seeded country if no guess)
     if company.address:
-        company.country = _guess_country(company.address)
+        company.country = _guess_country(company.address) or company.country
 
     # Add data source
     company.data_sources_used = "northdata"

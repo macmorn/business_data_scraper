@@ -84,6 +84,12 @@ def extract_text(
     except (FileNotFoundError, RuntimeError) as e:
         if "PDF not found" in str(e):
             raise
+        if use_layout:
+            raise RuntimeError(
+                f"pdftotext is required for tabular PDF layouts but is not installed. "
+                f"Install it with: brew install poppler (macOS) or apt-get install poppler-utils (Linux). "
+                f"Original error: {e}"
+            )
         logger.warning("pdftotext failed (%s), trying PyMuPDF fallback", e)
         return extract_text_pymupdf(pdf_path)
 
@@ -477,7 +483,7 @@ def apply_field_mapping(records: list[dict], layout: PDFLayout) -> list[dict]:
 def build_address(record: dict) -> str | None:
     """Combine address_street, address_city, address_country into one string."""
     parts = []
-    for field in ("address_street", "address_city", "address_country"):
+    for field in ("address_street", "address_postal", "address_city", "address_country"):
         val = record.get(field)
         if val and val.strip():
             parts.append(val.strip())
@@ -551,6 +557,14 @@ def run(country_filter: set[str] | None = None) -> None:
         country_raw = record.get("address_country")
         if country_raw:
             extras["country"] = _normalize_country(country_raw)
+        elif layout.default_country:
+            extras["country"] = layout.default_country
+        # Seed pre-known fields carried by the input list (persisted to the DB
+        # so enrichment confirms/augments them rather than re-deriving).
+        for seed_field in ("category", "ceo_name", "employees_range"):
+            val = record.get(seed_field)
+            if val and val.strip():
+                extras[seed_field] = val.strip()
         for extra_field in ("vendor_code", "cage_code", "product_group"):
             if extra_field in record:
                 extras[extra_field] = record[extra_field]
@@ -653,6 +667,10 @@ def _apply_extra_data(extra_data: dict[str, dict]) -> None:
             if "country" in extras:
                 updates.append("country = ?")
                 params.append(extras["country"])
+            for seed_field in ("category", "ceo_name", "employees_range"):
+                if seed_field in extras:
+                    updates.append(f"{seed_field} = ?")
+                    params.append(extras[seed_field])
             if updates:
                 params.append(name)
                 conn.execute(

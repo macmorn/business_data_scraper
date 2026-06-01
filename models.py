@@ -69,6 +69,7 @@ class CompanyRecord:
     # Corporate purpose / industry
     corporate_purpose: str | None = None
     industry_code: str | None = None  # e.g. "20.5"
+    category: str | None = None  # category/sector seeded from the input list
 
     # CEO / leadership
     ceo_name: str | None = None
@@ -112,6 +113,7 @@ CSV_COLUMNS = [
     "lei",
     "vat_id",
     "industry_code",
+    "category",
     "corporate_purpose",
     "founded_year",
     "employees_count",

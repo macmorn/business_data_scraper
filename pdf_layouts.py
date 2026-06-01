@@ -69,6 +69,10 @@ class PDFLayout:
     # For Excel parse_mode: mapping from spreadsheet header → internal field name
     header_mapping: dict[str, str] = field(default_factory=dict)
 
+    # Default ISO country code applied when a record has no country column/value
+    # (e.g. a single-region list with no Country column). None = leave empty.
+    default_country: str | None = None
+
 
 # ============================================================
 # Layout: Airbus Approved Suppliers List
@@ -230,6 +234,52 @@ BOEING_SUPPLIERS = PDFLayout(
 
 
 # ============================================================
+# Cologne HVAC master list (Excel)
+# Columns: #, Company, Category, Phone, Address, Comment
+# No country column (all Cologne / Germany); Address is one combined string.
+# ============================================================
+
+COLOGNE_HVAC = PDFLayout(
+    name="cologne_hvac",
+    description="Cologne HVAC master list (Excel): Company, Category, Address",
+    parse_mode="excel",
+    fields=[],
+    header_mapping={
+        "Company": "name_original",
+        "Category": "category",
+        "Address": "address_street",  # single combined address string
+    },
+    field_mapping={},
+    default_country="DE",  # no country column; all Cologne / Germany
+)
+
+
+# ============================================================
+# WLW Heizung/Klima/Lueftung companies (Excel)
+# Columns: Company Name, Employee Count, CEO / Executive Contact, Street,
+# Postal Code, City, Country, WLW Profile URL, Source Page, Scrape Status
+# Carries already-known CEO and employee-count data to seed.
+# ============================================================
+
+WLW_HVAC = PDFLayout(
+    name="wlw_hvac",
+    description="WLW Heizung/Klima/Lueftung companies (Excel)",
+    parse_mode="excel",
+    fields=[],
+    header_mapping={
+        "Company Name": "name_original",
+        "Employee Count": "employees_range",
+        "CEO / Executive Contact": "ceo_name",
+        "Street": "address_street",
+        "Postal Code": "address_postal",
+        "City": "address_city",
+        "Country": "address_country",
+    },
+    field_mapping={},
+)
+
+
+# ============================================================
 # Registry of all available layouts
 # ============================================================
 
@@ -238,6 +288,8 @@ LAYOUTS: dict[str, PDFLayout] = {
     "simple_name_list": SIMPLE_NAME_LIST,
     "a220_suppliers": A220_SUPPLIERS,
     "boeing_suppliers": BOEING_SUPPLIERS,
+    "cologne_hvac": COLOGNE_HVAC,
+    "wlw_hvac": WLW_HVAC,
 }
 
 # Default layout
