@@ -111,6 +111,8 @@ async def run() -> None:
                     )
                     if summary:
                         company.corporate_structure_summary = summary
+                except claude_ai.ClaudeUsageLimitError:
+                    raise
                 except Exception as e:
                     logger.warning(
                         "Structure summary generation failed for '%s': %s",
@@ -130,6 +132,17 @@ async def run() -> None:
                     ", ".join(action_parts) if action_parts else "traversed",
                 )
 
+            except claude_ai.ClaudeUsageLimitError as e:
+                logger.error(
+                    "Usage limit hit at '%s' (subtype=%s) — stopping Stage 4b; "
+                    "remaining companies stay at pending_structure for rerun",
+                    company.name_original, e.subtype,
+                )
+                db.mark_for_rerun(
+                    company.id, f"usage_limit_reached:{e.subtype}", STAGE_PENDING_STRUCTURE
+                )
+                results["error"] += 1
+                break
             except Exception as e:
                 logger.error("Structure traversal error for '%s': %s", company.name_original, e)
                 db.mark_failed(company.id, str(e))

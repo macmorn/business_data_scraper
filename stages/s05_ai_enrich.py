@@ -97,6 +97,17 @@ async def run() -> None:
                     action.append("financials")
                 tracker.tick(company.name_original, ", ".join(action) if action else "passed through")
 
+            except claude_ai.ClaudeUsageLimitError as e:
+                logger.error(
+                    "Usage limit hit at '%s' (subtype=%s) — stopping Stage 5; "
+                    "remaining companies stay at pending_ai for rerun",
+                    company.name_original, e.subtype,
+                )
+                db.mark_for_rerun(
+                    company.id, f"usage_limit_reached:{e.subtype}", STAGE_PENDING_AI
+                )
+                results["error"] += 1
+                break
             except asyncio.TimeoutError:
                 logger.error(
                     "Company '%s' enrichment timed out after %ds, moving on",
@@ -144,6 +155,8 @@ async def _enrich_company(
                 company.ceo_career_summary = ceo_data.get("career_summary")
                 company.ceo_linkedin_url = ceo_data.get("linkedin_url")
                 results["summary_generated"] += 1
+            except claude_ai.ClaudeUsageLimitError:
+                raise
             except Exception as e:
                 logger.warning("CEO research failed for %s: %s", company.ceo_name, e)
         else:
@@ -161,6 +174,8 @@ async def _enrich_company(
                     company.ceo_confidence = "medium"
                     results["ceo_discovered"] += 1
                     logger.info("  Discovered CEO for '%s': %s", company.name_original, company.ceo_name)
+            except claude_ai.ClaudeUsageLimitError:
+                raise
             except Exception as e:
                 logger.warning("CEO discovery failed for '%s': %s", company.name_original, e)
 
@@ -189,6 +204,8 @@ async def _enrich_company(
                     company.total_assets = fin_data["total_assets"]
                 _append_source(company, "claude_web")
                 results["financials_enriched"] += 1
+            except claude_ai.ClaudeUsageLimitError:
+                raise
             except Exception as e:
                 logger.warning("Financial enrichment failed for '%s': %s", company.name_original, e)
 
@@ -208,6 +225,8 @@ async def _enrich_company(
                     company.employees_range = emp_count
                 _append_source(company, "claude_web")
                 logger.info("  Estimated employees for '%s': %s", company.name_original, emp_count)
+        except claude_ai.ClaudeUsageLimitError:
+            raise
         except Exception as e:
             logger.warning("Employee estimation failed for '%s': %s", company.name_original, e)
 
@@ -225,6 +244,8 @@ async def _enrich_company(
             )
             if summary:
                 company.corporate_structure_summary = summary
+        except claude_ai.ClaudeUsageLimitError:
+            raise
         except Exception as e:
             logger.warning("Structure summary failed for '%s': %s", company.name_original, e)
 

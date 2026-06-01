@@ -14,6 +14,7 @@ import re
 from claude_agent_sdk import (
     query,
     ClaudeAgentOptions,
+    AssistantMessage,
     CLIConnectionError,
     ProcessError,
     ResultMessage,
@@ -29,12 +30,41 @@ class ClaudeTimeoutError(Exception):
     pass
 
 
+class ClaudeUsageLimitError(Exception):
+    """Raised when a Claude Agent SDK call hits a usage / rate / billing limit.
+
+    Carries the SDK error subtype so the stage can record exactly why and leave
+    the company in a re-runnable state. Deliberately NOT retried — retrying a
+    usage limit immediately is pointless.
+    """
+
+    def __init__(self, subtype: str):
+        self.subtype = subtype
+        super().__init__(f"Claude usage limit reached (subtype={subtype})")
+
+
 # Semaphore to limit concurrent Claude calls
 _semaphore = asyncio.Semaphore(5)
+
+# Model + reasoning effort applied to every Claude call (all helpers funnel
+# through _ask_claude). Set explicitly to Sonnet / medium effort.
+_MODEL = "sonnet"
+_EFFORT = "medium"
 
 # Timeouts for Claude calls (seconds)
 _TIMEOUT_WEB = 120    # web-search enabled — network round-trips can be slow
 _TIMEOUT_PLAIN = 60   # text generation only
+
+# Substrings that mark a usage/rate/billing limit in SDK error text.
+_LIMIT_MARKERS = ("usage limit", "rate limit", "rate_limit", "billing")
+
+
+def _looks_like_limit(text: str | None) -> bool:
+    """True if the SDK error text looks like a usage/rate/billing limit."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _LIMIT_MARKERS)
 
 
 async def _ask_claude(
@@ -52,6 +82,8 @@ async def _ask_claude(
     options = ClaudeAgentOptions(
         allowed_tools=["WebSearch", "WebFetch"] if use_web else [],
         max_turns=6 if use_web else 1,
+        model=_MODEL,
+        effort=_EFFORT,
     )
     if system_prompt:
         options.system_prompt = system_prompt
@@ -67,11 +99,36 @@ async def _ask_claude(
         async def _collect() -> None:
             nonlocal result
             async for message in gen:
+                # Primary signal: the assistant-message error enum from the SDK.
+                if isinstance(message, AssistantMessage) and message.error in (
+                    "rate_limit", "billing_error"
+                ):
+                    raise ClaudeUsageLimitError(message.error)
                 if isinstance(message, ResultMessage):
+                    if message.is_error and (
+                        _looks_like_limit(message.subtype)
+                        or _looks_like_limit(message.result)
+                    ):
+                        subtype = message.subtype or message.stop_reason or "result_error"
+                        raise ClaudeUsageLimitError(subtype)
+                    if message.is_error:
+                        # Other result errors: surface the subtype for visibility.
+                        logger.warning(
+                            "Claude result error (subtype=%s, stop_reason=%s)",
+                            message.subtype, message.stop_reason,
+                        )
                     result = message.result
 
         try:
             await asyncio.wait_for(_collect(), timeout=timeout)
+        except ClaudeUsageLimitError as e:
+            logger.error("Claude usage limit reached (subtype=%s)", e.subtype)
+            # Close the generator to kill the subprocess, then propagate.
+            try:
+                await asyncio.wait_for(gen.aclose(), timeout=10)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            raise
         except asyncio.TimeoutError:
             logger.warning(
                 "Claude call timed out after %ds (use_web=%s), closing generator",

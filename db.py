@@ -206,6 +206,21 @@ def mark_failed(record_id: int, error: str) -> None:
         )
 
 
+def mark_for_rerun(record_id: int, error: str, stage: str) -> None:
+    """Park a company at a pending stage for a later rerun, WITHOUT burning a retry.
+
+    Used when a Claude usage limit is hit: the company keeps its retry budget and
+    is simply left at the given pending stage so the next run re-enriches it.
+    """
+    with _get_conn() as conn:
+        conn.execute(
+            """UPDATE companies SET
+                error=?, stage=?, updated_at=datetime('now')
+            WHERE id=?""",
+            (error, stage, record_id),
+        )
+
+
 def get_stats() -> dict[str, int]:
     """Return counts per stage for progress reporting."""
     with _get_conn() as conn:

@@ -95,14 +95,29 @@ async def run() -> None:
                         results["not_found"] += 1
                         tracker.tick(company.name_original, "not found")
 
-                else:  # error
-                    db.mark_failed(company.id, result.get("error", "unknown error"))
+                else:  # error — reroute to fallback so the company still gets
+                       # web enrichment instead of dead-ending at 'failed'.
+                    company.stage = STAGE_PENDING_FALLBACK
+                    company.error = f"northdata_error:{result.get('error', 'unknown error')}"
                     results["error"] += 1
-                    tracker.tick(company.name_original, f"error: {result.get('error', '')}")
-                    continue
+                    tracker.tick(
+                        company.name_original,
+                        f"error → fallback: {result.get('error', '')}",
+                    )
 
                 db.update_company(company)
 
+            except claude_ai.ClaudeUsageLimitError as e:
+                logger.error(
+                    "Usage limit hit at '%s' (subtype=%s) — stopping Stage 2; "
+                    "remaining companies stay at pending_northdata for rerun",
+                    company.name_original, e.subtype,
+                )
+                db.mark_for_rerun(
+                    company.id, f"usage_limit_reached:{e.subtype}", STAGE_PENDING_NORTHDATA
+                )
+                results["error"] += 1
+                break
             except Exception as e:
                 logger.error("Unexpected error for '%s': %s", company.name_original, e)
                 db.mark_failed(company.id, str(e))
@@ -222,6 +237,8 @@ async def _resolve_with_claude(company, client: NorthdataClient, rate_limiter: R
             resolution.get("northdata_url"),
             resolution.get("reasoning", ""),
         )
+    except claude_ai.ClaudeUsageLimitError:
+        raise
     except Exception as e:
         logger.warning("Claude name resolution failed for '%s': %s", company.name_original, e)
         return False
