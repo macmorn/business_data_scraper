@@ -668,17 +668,43 @@ field you cannot find. Do not guess."""
         },
     )
 
+    raw = result or ""
+
     empty = {
         "ceo": {"name": None, "title": None, "linkedin_url": None, "career_summary": None},
         "financials": {"employees_count": None, "revenue": None, "total_assets": None},
         "business_description": None,
         "source_notes": None,
+        "raw": raw,
     }
 
     parsed = _try_parse_json(result)
     if not isinstance(parsed, dict):
-        logger.warning("enrich_company: could not parse response for '%s': %s",
-                       company_name, (result or "")[:200])
+        # Parse failed. If there is non-empty prose, salvage a business
+        # description (+ LinkedIn) from it instead of discarding everything.
+        if raw.strip():
+            salvaged = _strip_markdown(raw)
+            if len(salvaged) > 1000:
+                salvaged = salvaged[:997] + "..."
+            logger.info(
+                "enrich_company: non-JSON response for '%s' — salvaged %d chars of prose",
+                company_name, len(salvaged),
+            )
+            return {
+                "ceo": {
+                    "name": None, "title": None,
+                    "linkedin_url": _extract_linkedin_url(raw),
+                    "career_summary": None,
+                },
+                "financials": {"employees_count": None, "revenue": None, "total_assets": None},
+                "business_description": salvaged or None,
+                "source_notes": None,
+                "raw": raw,
+            }
+        logger.warning(
+            "enrich_company: empty/unparseable response for '%s' (len=%d)",
+            company_name, len(raw),
+        )
         return empty
 
     # Merge onto the empty skeleton so callers always get the full shape.
@@ -698,6 +724,7 @@ field you cannot find. Do not guess."""
         },
         "business_description": parsed.get("business_description"),
         "source_notes": parsed.get("source_notes"),
+        "raw": raw,
     }
 
 
