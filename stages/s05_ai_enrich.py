@@ -49,6 +49,7 @@ async def run() -> None:
     results = {
         "disambiguated": 0, "summary_generated": 0, "ceo_discovered": 0,
         "financials_enriched": 0, "skipped": 0, "error": 0,
+        "skipped_usage_limit": 0,
     }
 
     # Check if any companies need northdata scraping (disambiguation with URL follow-up)
@@ -72,7 +73,7 @@ async def run() -> None:
     source_run = Path(config.INPUT_PDF).stem
 
     try:
-        for company in companies:
+        for index, company in enumerate(companies):
             try:
                 await asyncio.wait_for(
                     _enrich_company(company, clie=client, rate_limiter=rate_limiter, results=results),
@@ -98,15 +99,21 @@ async def run() -> None:
                 tracker.tick(company.name_original, ", ".join(action) if action else "passed through")
 
             except claude_ai.ClaudeUsageLimitError as e:
+                # Park the current company AND every remaining (unprocessed) company
+                # in this batch for rerun, recording the reason on each. They keep
+                # their retry budget and stay at pending_ai for the next run.
+                remaining = companies[index:]
+                marker = f"usage_limit_reached:{e.subtype}"
+                for pending in remaining:
+                    db.mark_for_rerun(pending.id, marker, STAGE_PENDING_AI)
+                results["skipped_usage_limit"] = len(remaining)
                 logger.error(
-                    "Usage limit hit at '%s' (subtype=%s) — stopping Stage 5; "
-                    "remaining companies stay at pending_ai for rerun",
+                    "Usage limit reached at '%s' (subtype=%s) — %d of %d companies "
+                    "were NOT AI-enriched (left at stage '%s'). Re-run the pipeline "
+                    "once the limit resets to finish them.",
                     company.name_original, e.subtype,
+                    len(remaining), len(companies), STAGE_PENDING_AI,
                 )
-                db.mark_for_rerun(
-                    company.id, f"usage_limit_reached:{e.subtype}", STAGE_PENDING_AI
-                )
-                results["error"] += 1
                 break
             except asyncio.TimeoutError:
                 logger.error(
