@@ -1,6 +1,116 @@
-# Stage 5: Empty-Response Handling, Raw Salvage, and Cache Guard
+# Stage 2 Login Failure + Stage 5 Empty-Response Handling, Raw Salvage, and Cache Guard
 
-## Problem
+This spec covers two related fixes from the same investigation. Both address the
+pipeline silently producing degraded/empty data instead of failing loudly:
+
+- **Part 0 — Northdata login failure** (the primary data source is silently
+  unauthenticated when the account is cancelled).
+- **Parts A–C — Stage 5 empty-response handling** (AI enrichment silently
+  passes empty results through to `done` and poisons the cache).
+
+---
+
+## Part 0 — Northdata login must fail loudly
+
+### Problem
+
+`clients/northdata_browser.py::_login()` is entirely non-fatal. Every failure
+path just logs and returns, leaving `self._logged_in = False`, and the pipeline
+proceeds to scrape Northdata **as an anonymous free-tier user**:
+
+- email input not found → `logger.error` + `return`
+- password input not found → `logger.error` + `return`
+- no logout link after submit → `logger.warning("login may have failed")`
+- any exception → `logger.error`
+
+The Northdata account was cancelled, so login silently fails and Stage 2 — the
+**primary** data source — returns only limited free-tier data (or none). This is
+a major contributor to empty output, larger than the Stage 5 issue.
+
+### Decisions (from user)
+
+- **Scope of failure:** *Fail Stage 2 only.* Login failure aborts Stage 2 loudly
+  but the pipeline continues to Stage 3 (registry fallback) and beyond, so
+  companies still get partial enrichment.
+- **Detection:** *Any non-success = failure.* Missing form fields, an exception
+  during login, OR no logout link after submit all count as login failure.
+
+### Solution
+
+`clients/northdata_browser.py`:
+
+- Add an exception class:
+
+  ```python
+  class NorthdataLoginError(Exception):
+      """Raised when premium login was attempted but did not succeed."""
+  ```
+
+- Rewrite `_login()` so each non-success path **raises** `NorthdataLoginError`
+  with a specific message, instead of logging+returning:
+  - email field not found → `raise NorthdataLoginError("email input not found")`
+  - password field not found → `raise NorthdataLoginError("password input not found")`
+  - after submit, no `logout`/`_logout` in page content →
+    `raise NorthdataLoginError("no logout link after submit — credentials rejected (account cancelled?)")`
+  - On the happy path, set `self._logged_in = True` as today.
+  - Wrap the body so an unexpected Playwright exception is re-raised as
+    `NorthdataLoginError(str(e))` (so the caller catches a single type). The
+    `finally: await page.close()` stays.
+- `start()` is unchanged in structure: it only calls `_login()` when BOTH
+  `self._email` and `self._password` are set. So "no credentials configured →
+  anonymous browsing" remains legitimate and never raises. When credentials ARE
+  set and login fails, `start()` now propagates `NorthdataLoginError`.
+
+`stages/s02_northdata.py::run()`:
+
+- Today: `await client.start()` is inside the `try:` whose `finally` calls
+  `client.stop()`. An exception from `start()` would propagate out of `run()` and
+  crash the WHOLE pipeline (`pipeline.py` awaits `run_northdata()` with no guard).
+- Change: catch `NorthdataLoginError` around `client.start()` specifically, log a
+  loud error, and **return early from Stage 2** (pipeline continues). The
+  `pending_northdata` companies stay at their stage for a rerun once the account
+  works. Concretely:
+
+  ```python
+  try:
+      await client.start()
+  except NorthdataLoginError as e:
+      logger.error(
+          "Northdata login FAILED (%s) — Stage 2 aborted. Companies remain at "
+          "pending_northdata. Fix NORTHDATA_EMAIL/PASSWORD (account may be "
+          "cancelled) and re-run. Continuing to fallback stages.", e,
+      )
+      await client.stop()
+      return
+  # ... existing per-company loop unchanged, still inside its own try/finally
+  ```
+
+  (Implementation detail: restructure so the early-return path closes the client
+  and the per-company loop keeps its existing `finally: client.stop()`. Ensure
+  `client.stop()` is not double-called.)
+
+### Files (Part 0)
+
+| File | Change |
+|------|--------|
+| `clients/northdata_browser.py` | Add `NorthdataLoginError`; `_login()` raises on any non-success; `start()` propagates it |
+| `stages/s02_northdata.py` | Catch `NorthdataLoginError` at `start()`, log loudly, return early (Stage 2 only) |
+
+### Edge Cases (Part 0)
+
+- **No credentials configured:** `start()` skips `_login()` entirely → no raise →
+  anonymous browsing as today. (Legitimate free-tier use.)
+- **Cookie-consent / Cloudflare during login:** surfaces as a Playwright
+  exception inside `_login()` → re-raised as `NorthdataLoginError` → Stage 2
+  aborts loudly (correct: we cannot confirm premium access).
+- **Double `stop()`:** guard the restructure so the browser is closed exactly
+  once on the login-failure path.
+
+---
+
+## Parts A–C — Stage 5 empty-response handling
+
+### Problem
 
 The latest export had 114 rows with no business info (empty
 `corporate_structure_summary`, `ceo_name`, `revenue`, …). Root cause, confirmed
