@@ -254,20 +254,35 @@ def _is_enriched(record) -> bool:
 This stops new empty records from entering the cache. It does NOT delete the 114
 already-poisoned rows — see "Existing bad data" below.
 
-### Existing bad data (the 114 already cached + exported)
+### Existing bad data — non-destructive recovery (cologne run)
 
-Out of scope for the code change, handled operationally:
+The 114 empty cologne `done` rows (and their 113 matching shared-cache entries,
+`source_run='2605 cologne_hvac_master_list_with_categories'`) are recovered
+WITHOUT deleting anything. Verified facts that make this safe:
 
-- The 114 empty cache rows (`cached_at=19:06`) will continue to short-circuit
-  Stage 5 until removed. After this fix, clear them so they re-enrich:
-  - `reset_for_rerun.py` already flips the per-file DB's empty `done` rows back
-    to `pending_ai`.
-  - The empty **cache** rows must also be deleted (e.g. a small SQL delete using
-    the same `_is_enriched`-style predicate, or `DELETE FROM enriched_companies
-    WHERE cached_at LIKE '2026-06-01 19:%'`). A follow-up rerun then re-attempts
-    enrichment with the fixed logic.
-- This spec does not auto-purge on startup (too destructive to do implicitly);
-  it will be a documented manual/utility step.
+- Those 113 cache rows still carry real **Northdata** data: 113/113 have
+  `northdata_raw` + `address`, 60 have `northdata_url`, 46 have `legal_form`.
+  Deleting them would discard data from the very source that is currently broken
+  (cancelled account) and hard to re-fetch. **So: no cache deletion.**
+- The cache lookup in `pipeline.py` (line 156) only fetches
+  `STAGE_PENDING_NORTHDATA` companies. `reset_for_rerun.py` flips the empty
+  `done` rows to `pending_ai`, which **skips the cache lookup entirely** and
+  re-enters Stage 5 directly. The poisoned cache rows are therefore inert for the
+  rerun.
+
+Recovery procedure (a plan step, reversible/preview-first):
+
+1. `uv run python reset_for_rerun.py --dry-run "data/2605 cologne_hvac_master_list_with_categories.db"`
+   to preview (expect ~114 eligible), then run without `--dry-run`. This only
+   changes `stage`/`error`; all Northdata fields are preserved.
+2. Re-run the pipeline for cologne once the fixes are in (and, ideally, once the
+   Northdata account works). Stage 5 re-enriches the `pending_ai` companies with
+   the corrected logic; Stage 6 then calls `cache.store()` with a now-enriched
+   record, **overwriting** the empty cache row in place (Northdata columns
+   retained via upsert). No row is ever deleted.
+
+The cache **write-guard** (Part C) prevents NEW empty rows from being written
+going forward; combined with the above, the cache self-heals on rerun.
 
 ## Files to Modify
 
