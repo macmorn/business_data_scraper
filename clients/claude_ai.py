@@ -98,7 +98,18 @@ async def _ask_claude(
 
         async def _collect() -> None:
             nonlocal result
+            model_logged = False
             async for message in gen:
+                # Record the model the SDK actually served (once per call), so
+                # pipeline.log shows which model handled each request rather than
+                # only the requested alias (_MODEL).
+                if isinstance(message, AssistantMessage):
+                    if not model_logged and message.model:
+                        logger.info(
+                            "Claude call served by model=%s (requested=%s, effort=%s, use_web=%s)",
+                            message.model, _MODEL, _EFFORT, use_web,
+                        )
+                        model_logged = True
                 # Primary signal: the assistant-message error enum from the SDK.
                 if isinstance(message, AssistantMessage) and message.error in (
                     "rate_limit", "billing_error"
