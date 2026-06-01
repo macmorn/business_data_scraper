@@ -540,6 +540,159 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 @with_retry(
     max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
 )
+async def enrich_company(
+    company_name: str,
+    country: str | None = None,
+    legal_form: str | None = None,
+    known_ceo_name: str | None = None,
+    known_ceo_title: str | None = None,
+    known_revenue: str | None = None,
+    known_employees: str | None = None,
+) -> dict:
+    """One merged web-search call: CEO + financials + business description.
+
+    Replaces the previous per-company chain of research_ceo/discover_ceo +
+    enrich_missing_financials + estimate_employee_count +
+    summarize_corporate_structure with a single Agent SDK call. Confirms/enriches
+    data we already have and fills gaps; tells Claude to use null for anything it
+    cannot verify so good Northdata data is never overwritten by guesses.
+
+    Returns a dict shaped like::
+
+        {
+          "ceo": {"name", "title", "linkedin_url", "career_summary"},
+          "financials": {"employees_count", "revenue", "total_assets"},
+          "business_description": str | None,
+          "source_notes": str | None,
+        }
+
+    On parse failure, returns the same shape with empty sub-dicts / None values.
+    """
+    # --- Build conditional context blocks ---
+    ceo_context = (
+        f'The known managing director / CEO is "{known_ceo_name}"'
+        f'{f" ({known_ceo_title})" if known_ceo_title else ""}. '
+        "Confirm this person, find their LinkedIn profile URL, and write a "
+        "2-3 sentence career summary."
+        if known_ceo_name
+        else (
+            "Find the current CEO, Geschäftsführer, or managing director, their "
+            "title, LinkedIn profile URL, and a 2-3 sentence career summary."
+        )
+    )
+
+    location = f" The company is based in {country}." if country else ""
+
+    kg_hint = ""
+    if legal_form and "co. kg" in legal_form.lower():
+        kg_hint = (
+            " This is a GmbH & Co. KG structure — the actual Geschäftsführer is "
+            "typically the managing director of the Komplementär-GmbH "
+            "(Verwaltungsgesellschaft / general partner)."
+        )
+
+    known_fin = []
+    if known_revenue:
+        known_fin.append(f"revenue is approximately {known_revenue}")
+    if known_employees:
+        known_fin.append(f"employee count is approximately {known_employees}")
+    known_fin_text = (
+        " Already known (do not contradict, only fill what is missing): "
+        + "; ".join(known_fin)
+        + "."
+        if known_fin
+        else ""
+    )
+
+    prompt = f"""Research the company "{company_name}".{location}{kg_hint}
+
+Gather three things in a single pass:
+
+1. LEADERSHIP: {ceo_context}
+2. FINANCIALS: employee count, revenue/turnover (most recent available), and
+   total assets if available.{known_fin_text} Look at the company website,
+   LinkedIn page, annual reports, business registries, and press releases.
+3. BUSINESS DESCRIPTION: a 2-4 sentence professional summary of the business —
+   what it does, its scale (revenue/employees), corporate structure, and who
+   leads it. Suitable for a business research report.
+
+Only include data you can actually verify from search results. Use null for any
+field you cannot find. Do not guess."""
+
+    result = await _ask_claude(
+        prompt=prompt,
+        use_web=True,
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "ceo": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": ["string", "null"]},
+                            "title": {"type": ["string", "null"]},
+                            "linkedin_url": {"type": ["string", "null"]},
+                            "career_summary": {"type": ["string", "null"]},
+                        },
+                        "required": ["name", "title", "linkedin_url", "career_summary"],
+                        "additionalProperties": False,
+                    },
+                    "financials": {
+                        "type": "object",
+                        "properties": {
+                            "employees_count": {"type": ["string", "null"]},
+                            "revenue": {"type": ["string", "null"]},
+                            "total_assets": {"type": ["string", "null"]},
+                        },
+                        "required": ["employees_count", "revenue", "total_assets"],
+                        "additionalProperties": False,
+                    },
+                    "business_description": {"type": ["string", "null"]},
+                    "source_notes": {"type": ["string", "null"]},
+                },
+                "required": ["ceo", "financials", "business_description", "source_notes"],
+                "additionalProperties": False,
+            },
+        },
+    )
+
+    empty = {
+        "ceo": {"name": None, "title": None, "linkedin_url": None, "career_summary": None},
+        "financials": {"employees_count": None, "revenue": None, "total_assets": None},
+        "business_description": None,
+        "source_notes": None,
+    }
+
+    parsed = _try_parse_json(result)
+    if not isinstance(parsed, dict):
+        logger.warning("enrich_company: could not parse response for '%s': %s",
+                       company_name, (result or "")[:200])
+        return empty
+
+    # Merge onto the empty skeleton so callers always get the full shape.
+    ceo = parsed.get("ceo") or {}
+    fin = parsed.get("financials") or {}
+    return {
+        "ceo": {
+            "name": ceo.get("name"),
+            "title": ceo.get("title"),
+            "linkedin_url": ceo.get("linkedin_url"),
+            "career_summary": ceo.get("career_summary"),
+        },
+        "financials": {
+            "employees_count": fin.get("employees_count"),
+            "revenue": fin.get("revenue"),
+            "total_assets": fin.get("total_assets"),
+        },
+        "business_description": parsed.get("business_description"),
+        "source_notes": parsed.get("source_notes"),
+    }
+
+
+@with_retry(
+    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+)
 async def estimate_employee_count(
     company_name: str,
     country: str | None = None,
