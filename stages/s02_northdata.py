@@ -9,7 +9,7 @@ import re
 import config
 import db
 from clients import claude_ai
-from clients.northdata_browser import NorthdataClient
+from clients.northdata_browser import NorthdataClient, NorthdataLoginError
 from models import (
     STAGE_PENDING_NORTHDATA,
     STAGE_PENDING_FALLBACK,
@@ -44,7 +44,17 @@ async def run() -> None:
     )
     try:
         await client.start()
+    except NorthdataLoginError as e:
+        logger.error(
+            "Northdata login FAILED (%s) — Stage 2 aborted. %d companies remain "
+            "at pending_northdata. Fix NORTHDATA_EMAIL/PASSWORD (the account may "
+            "be cancelled/expired) and re-run. Continuing to fallback stages.",
+            e, len(companies),
+        )
+        await client.stop()
+        return
 
+    try:
         for company in companies:
             await rate_limiter.wait()
 
