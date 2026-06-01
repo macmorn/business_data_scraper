@@ -11,6 +11,16 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 logger = logging.getLogger(__name__)
 
+
+class NorthdataLoginError(Exception):
+    """Raised when premium login was attempted but did not succeed.
+
+    Only raised when credentials were provided (NORTHDATA_EMAIL/PASSWORD). A
+    failed login means we'd otherwise silently scrape as an anonymous free-tier
+    user — likely a cancelled/expired account.
+    """
+
+
 # Northdata URLs that are NOT company pages (used to filter autocomplete results)
 _SKIP_HREFS = {
     "help.northdata.com", "_privacy", "_terms", "_contact", "_premium",
@@ -99,7 +109,11 @@ class NorthdataClient:
         logger.info("Northdata browser launched (logged_in=%s)", self._logged_in)
 
     async def _login(self) -> None:
-        """Log in to Northdata with premium credentials."""
+        """Log in to Northdata with premium credentials.
+
+        Raises NorthdataLoginError on ANY non-success (missing form fields,
+        unexpected exception, or no logout link after submit).
+        """
         page = await self._context.new_page()
         try:
             await page.goto("https://www.northdata.com/_login", wait_until="domcontentloaded", timeout=30000)
@@ -109,8 +123,7 @@ class NorthdataClient:
             # Fill email/username
             email_input = await page.query_selector('input[name="email"], input[type="email"], input[name="username"]')
             if not email_input:
-                logger.error("Login page: email input not found")
-                return
+                raise NorthdataLoginError("email input not found on login page")
 
             await email_input.click()
             await _human_delay(page, 200, 500)
@@ -119,8 +132,7 @@ class NorthdataClient:
             # Fill password
             pw_input = await page.query_selector('input[name="password"], input[type="password"]')
             if not pw_input:
-                logger.error("Login page: password input not found")
-                return
+                raise NorthdataLoginError("password input not found on login page")
 
             await pw_input.click()
             await _human_delay(page, 200, 500)
@@ -143,9 +155,16 @@ class NorthdataClient:
                 self._logged_in = True
                 logger.info("Successfully logged in to Northdata as %s", self._email)
             else:
-                logger.warning("Northdata login may have failed — no logout link found")
+                raise NorthdataLoginError(
+                    "no logout link after submit — credentials rejected "
+                    "(account cancelled/expired?)"
+                )
+        except NorthdataLoginError:
+            raise
         except Exception as e:
-            logger.error("Northdata login error: %s", e)
+            # Any other failure (navigation, Cloudflare, selector timeout) is
+            # also a login failure — we cannot confirm premium access.
+            raise NorthdataLoginError(f"login error: {e}") from e
         finally:
             await page.close()
 
