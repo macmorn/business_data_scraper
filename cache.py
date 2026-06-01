@@ -202,8 +202,32 @@ def _cache_row_to_record(row: sqlite3.Row) -> CompanyRecord:
     )
 
 
+def _is_enriched(record: CompanyRecord) -> bool:
+    """True if the record carries real enrichment worth caching.
+
+    Failed/empty enrichment (e.g. an empty Claude response) must NOT be cached:
+    a cached empty row would short-circuit Stage 5 on future runs. Content-based
+    because the cache table has no stage/error/needs_review columns.
+    """
+    return bool(
+        (record.corporate_structure_summary or "").strip()
+        or (record.ceo_name or "").strip()
+        or (record.ceo_career_summary or "").strip()
+        or (record.revenue or "").strip()
+        or (record.employees_count or "").strip()
+        or "claude_web" in (record.data_sources_used or "")
+    )
+
+
 def store(record: CompanyRecord, source_run: str) -> None:
-    """Upsert a fully enriched company record into the cache."""
+    """Upsert a fully enriched company record into the cache.
+
+    Records that failed/empty enrichment are skipped (not cached), so they are
+    re-attempted on the next run rather than locked in.
+    """
+    if not _is_enriched(record):
+        logger.debug("Cache: skipping un-enriched record '%s'", record.name_original)
+        return
     _store_records([record], source_run)
 
 
@@ -214,7 +238,10 @@ def store_batch(records: list[CompanyRecord], source_run: str) -> None:
 
 
 def _store_records(records: list[CompanyRecord], source_run: str) -> None:
-    """Internal: upsert records into the cache table."""
+    """Internal: upsert records into the cache table (enriched records only)."""
+    records = [r for r in records if _is_enriched(r)]
+    if not records:
+        return
     cols = _ENRICHMENT_COLUMNS + ["source_run"]
     placeholders = ",".join("?" * len(cols))
     col_names = ",".join(cols)
