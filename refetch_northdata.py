@@ -18,10 +18,14 @@ rather than writing empty/anonymous data. Run in a normal terminal (not nested
 in a Claude Code session) with working NORTHDATA_EMAIL/PASSWORD in .env:
 
     uv run python refetch_northdata.py --dry-run "data/foo.db" ["data/bar.db" ...]
-    uv run python refetch_northdata.py "data/foo.db"
-    uv run python refetch_northdata.py --all-with-url "data/foo.db"   # not just missing-financials
+    uv run python refetch_northdata.py "data/foo.db"                  # missing financials
+    uv run python refetch_northdata.py --incomplete "data/foo.db"     # missing financials OR officers
+    uv run python refetch_northdata.py --all-with-url "data/foo.db"   # every row with a url
 
-By default only rows that have a northdata_url AND lack financials are re-fetched.
+By default only rows that have a northdata_url AND lack ALL financials are
+re-fetched. --incomplete additionally re-fetches rows missing the officers list
+(rows the old parser left half-populated). --all-with-url re-fetches everything
+with a url.
 """
 
 from __future__ import annotations
@@ -44,14 +48,20 @@ from utils.rate_limiter import RateLimiter
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("refetch_northdata")
 
-# A row is eligible when it has a northdata_url and (unless --all-with-url) is
-# missing all three core financial signals.
+# Eligibility predicates (a row always needs a northdata_url to be re-fetched):
+#   default      -> missing ALL financials (revenue/employees/total_assets)
+#   --incomplete -> missing financials OR missing the officers/legal-rep list
+#                   (catches rows the old parser left half-populated, e.g. a bare
+#                    revenue value but no officers/history)
+#   --all-with-url -> every row with a northdata_url
 _HAS_URL = "northdata_url IS NOT NULL AND northdata_url != ''"
 _MISSING_FIN = (
     "(revenue IS NULL OR revenue='') "
     "AND (employees_count IS NULL OR employees_count='') "
     "AND (total_assets IS NULL OR total_assets='')"
 )
+_MISSING_OFFICERS = "(officers IS NULL OR officers='' OR officers='[]')"
+_INCOMPLETE = f"(({_MISSING_FIN}) OR {_MISSING_OFFICERS})"
 
 
 class _Row:
@@ -140,19 +150,26 @@ async def refetch_db(
     rate_limiter: RateLimiter,
     db_path: Path,
     *,
-    all_with_url: bool,
+    mode: str,
     dry_run: bool,
 ) -> tuple[int, int, int]:
-    """Re-fetch eligible rows in one DB. Returns (eligible, updated, gained_financials)."""
-    where = _HAS_URL if all_with_url else f"{_HAS_URL} AND {_MISSING_FIN}"
+    """Re-fetch eligible rows in one DB. Returns (eligible, updated, gained_financials).
+
+    mode: "missing-fin" (default) | "incomplete" | "all-with-url".
+    """
+    selector = {
+        "all-with-url": _HAS_URL,
+        "incomplete": f"{_HAS_URL} AND {_INCOMPLETE}",
+        "missing-fin": f"{_HAS_URL} AND {_MISSING_FIN}",
+    }[mode]
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            f"SELECT * FROM companies WHERE {where} ORDER BY id"
+            f"SELECT * FROM companies WHERE {selector} ORDER BY id"
         ).fetchall()
         eligible = len(rows)
-        logger.info("%s: %d eligible rows (all_with_url=%s)", db_path.name, eligible, all_with_url)
+        logger.info("%s: %d eligible rows (mode=%s)", db_path.name, eligible, mode)
         if dry_run:
             return eligible, 0, 0
 
@@ -219,11 +236,19 @@ async def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("db_paths", nargs="+", type=Path, help="SQLite DB file(s)")
     parser.add_argument("--dry-run", action="store_true", help="Report eligible counts; scrape nothing")
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--all-with-url", action="store_true",
-        help="Re-fetch every row with a northdata_url, not just those missing financials",
+        help="Re-fetch every row with a northdata_url",
+    )
+    group.add_argument(
+        "--incomplete", action="store_true",
+        help="Re-fetch rows missing financials OR the officers/legal-rep list "
+             "(catches rows the old parser left half-populated)",
     )
     args = parser.parse_args(argv)
+
+    mode = "all-with-url" if args.all_with_url else "incomplete" if args.incomplete else "missing-fin"
 
     missing = [p for p in args.db_paths if not p.exists()]
     for p in missing:
@@ -234,7 +259,7 @@ async def main(argv: list[str] | None = None) -> int:
     # Dry-run never needs a browser/login.
     if args.dry_run:
         for db_path in args.db_paths:
-            await refetch_db(None, None, db_path, all_with_url=args.all_with_url, dry_run=True)
+            await refetch_db(None, None, db_path, mode=mode, dry_run=True)
         return 0
 
     client = NorthdataClient(
@@ -264,7 +289,7 @@ async def main(argv: list[str] | None = None) -> int:
         for db_path in args.db_paths:
             e, u, g = await refetch_db(
                 client, rate_limiter, db_path,
-                all_with_url=args.all_with_url, dry_run=False,
+                mode=mode, dry_run=False,
             )
             grand[0] += e; grand[1] += u; grand[2] += g
     finally:
