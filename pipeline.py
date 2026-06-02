@@ -179,9 +179,17 @@ async def run(country_filter: set[str] | None = None) -> None:
     stats = db.get_stats()
     logger.info("Pipeline state: %s", stats)
 
-    # Stage 2: Northdata lookup
+    # Claude-using stages are wrapped in run_with_hibernation: if the Claude
+    # usage limit is hit, the stage parks its remaining work (staying at its
+    # pending stage) and re-raises; the wrapper sleeps 10 min and re-runs the
+    # stage, which resumes the parked companies — looping until the stage
+    # finishes without hitting the limit. No manual restart needed. (Ctrl-C
+    # during a hibernation sleep aborts; parked work stays for a later run.)
+    from utils.hibernation import run_with_hibernation
+
+    # Stage 2: Northdata lookup (uses Claude for not_found name/URL resolution)
     from stages.s02_northdata import run as run_northdata
-    await run_northdata()
+    await run_with_hibernation(run_northdata, label="Stage 2: Northdata lookup")
 
     # Stage 3: Registry fallback for companies not found on Northdata
     from stages.s03_registry_fallback import run as run_fallback
@@ -193,11 +201,11 @@ async def run(country_filter: set[str] | None = None) -> None:
 
     # Stage 4b: Corporate structure traversal (follow holding/KG links)
     from stages.s04b_structure import run as run_structure
-    await run_structure()
+    await run_with_hibernation(run_structure, label="Stage 4b: Corporate structure")
 
     # Stage 5: AI enrichment (disambiguation + career summaries)
     from stages.s05_ai_enrich import run as run_ai
-    await run_ai()
+    await run_with_hibernation(run_ai, label="Stage 5: AI enrichment")
 
     # Stage 6: Normalize fields
     from stages.s06_normalize import run as run_normalize

@@ -142,7 +142,10 @@ async def run() -> None:
                     company.id, f"usage_limit_reached:{e.subtype}", STAGE_PENDING_STRUCTURE
                 )
                 results["error"] += 1
-                break
+                tracker.summary(results)
+                # Re-raise so the caller can hibernate + resume; remaining
+                # companies stay at pending_structure and are picked up on retry.
+                raise
             except Exception as e:
                 logger.error("Structure traversal error for '%s': %s", company.name_original, e)
                 db.mark_failed(company.id, str(e))

@@ -109,12 +109,15 @@ async def run() -> None:
                 results["skipped_usage_limit"] = len(remaining)
                 logger.error(
                     "Usage limit reached at '%s' (subtype=%s) — %d of %d companies "
-                    "were NOT AI-enriched (left at stage '%s'). Re-run the pipeline "
-                    "once the limit resets to finish them.",
+                    "were NOT AI-enriched (left at stage '%s').",
                     company.name_original, e.subtype,
                     len(remaining), len(companies), STAGE_PENDING_AI,
                 )
-                break
+                tracker.summary(results)
+                # Re-raise so the caller can hibernate + resume the parked work.
+                # (Remaining companies stay at pending_ai; re-running this stage
+                # continues them.)
+                raise
             except asyncio.TimeoutError:
                 logger.error(
                     "Company '%s' enrichment timed out after %ds, moving on",

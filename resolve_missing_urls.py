@@ -35,6 +35,7 @@ import db
 from clients.northdata_browser import NorthdataClient, NorthdataLoginError
 from clients import claude_ai
 from stages.s02_northdata import _resolve_with_claude
+from utils.hibernation import run_with_hibernation
 from utils.rate_limiter import RateLimiter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -72,17 +73,19 @@ async def resolve_db(
     db_path: Path,
     *,
     dry_run: bool,
-) -> tuple[int, int, bool]:
-    """Resolve missing-URL companies in one DB.
+) -> tuple[int, int]:
+    """Resolve missing-URL companies in one DB. Returns (eligible, resolved).
 
-    Returns (eligible, resolved, hit_usage_limit).
+    Re-queries the missing-URL set on entry, so it is resumable: if it raises
+    ClaudeUsageLimitError partway, re-invoking it continues the still-unresolved
+    companies (resolved ones now have a url and are excluded).
     """
     # Bind db.* to this file so update_company / _row_to_record target it.
     config.DB_PATH = str(db_path)
     ids = _missing_url_ids(db_path)
     logger.info("%s: %d companies missing a northdata_url", db_path.name, len(ids))
     if dry_run:
-        return len(ids), 0, False
+        return len(ids), 0
 
     resolved = 0
     for record_id in ids:
@@ -91,13 +94,10 @@ async def resolve_db(
             continue
         try:
             ok = await _resolve_with_claude(company, client, rate_limiter)
-        except claude_ai.ClaudeUsageLimitError as e:
-            logger.error(
-                "Claude usage limit hit at '%s' (subtype=%s) — stopping. "
-                "Remaining missing-URL companies are untouched; re-run later.",
-                company.name_original, e.subtype,
-            )
-            return len(ids), resolved, True
+        except claude_ai.ClaudeUsageLimitError:
+            # Re-raise so the caller can hibernate + resume. The current company
+            # was not resolved (still has no url), so a retry re-attempts it.
+            raise
         except Exception as e:
             logger.warning("Resolve error for '%s': %s", company.name_original, e)
             continue
@@ -113,7 +113,7 @@ async def resolve_db(
         else:
             logger.info("  unresolved '%s' (left as-is)", company.name_original)
 
-    return len(ids), resolved, False
+    return len(ids), resolved
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -133,7 +133,7 @@ async def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         total = 0
         for db_path in args.db_paths:
-            e, _, _ = await resolve_db(None, None, db_path, dry_run=True)
+            e, _ = await resolve_db(None, None, db_path, dry_run=True)
             total += e
         logger.info("Dry-run: %d companies missing a northdata_url across %d DB(s).", total, len(args.db_paths))
         return 0
@@ -161,23 +161,19 @@ async def main(argv: list[str] | None = None) -> int:
 
     rate_limiter = RateLimiter(config.NORTHDATA_DELAY_MIN, config.NORTHDATA_DELAY_MAX)
     grand_eligible = grand_resolved = 0
-    stopped = False
     try:
         for db_path in args.db_paths:
-            e, r, hit = await resolve_db(client, rate_limiter, db_path, dry_run=False)
+            # Hibernate + resume on the Claude usage limit instead of stopping.
+            e, r = await run_with_hibernation(
+                lambda p=db_path: resolve_db(client, rate_limiter, p, dry_run=False),
+                label=f"resolve {db_path.name}",
+            )
             grand_eligible += e
             grand_resolved += r
-            if hit:
-                stopped = True
-                break  # usage limit: stop before touching the next DB
     finally:
         await client.stop()
 
-    logger.info(
-        "Done%s. Eligible=%d, resolved=%d.",
-        " (stopped at usage limit)" if stopped else "",
-        grand_eligible, grand_resolved,
-    )
+    logger.info("Done. Eligible=%d, resolved=%d.", grand_eligible, grand_resolved)
     return 0
 
 
