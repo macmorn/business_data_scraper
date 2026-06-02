@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 class ClaudeTimeoutError(Exception):
     """Raised when a Claude Agent SDK call exceeds its timeout."""
+
     pass
 
 
@@ -52,8 +53,8 @@ _MODEL = "sonnet"
 _EFFORT = "medium"
 
 # Timeouts for Claude calls (seconds)
-_TIMEOUT_WEB = 120    # web-search enabled — network round-trips can be slow
-_TIMEOUT_PLAIN = 60   # text generation only
+_TIMEOUT_WEB = 200  # web-search enabled — network round-trips can be slow
+_TIMEOUT_PLAIN = 60  # text generation only
 
 # Substrings that mark a usage/rate/billing limit in SDK error text.
 _LIMIT_MARKERS = ("usage limit", "rate limit", "rate_limit", "billing")
@@ -79,9 +80,14 @@ async def _ask_claude(
         use_web: If True, enables WebSearch and WebFetch tools with up to 6
                  turns so Claude can research online before responding.
     """
+    # Web calls need a generous turn budget: at high effort the model emits a
+    # ThinkingBlock before each tool call, so a few web searches burn ~2 turns
+    # each. Measured ~13 assistant turns for a focused single-topic search; 6
+    # (and even 12) could run out before the final answer -> empty result. 18
+    # leaves comfortable headroom and still finishes well under the timeout.
     options = ClaudeAgentOptions(
         allowed_tools=["WebSearch", "WebFetch"] if use_web else [],
-        max_turns=6 if use_web else 1,
+        max_turns=18 if use_web else 1,
         model=_MODEL,
         effort=_EFFORT,
     )
@@ -107,12 +113,16 @@ async def _ask_claude(
                     if not model_logged and message.model:
                         logger.info(
                             "Claude call served by model=%s (requested=%s, effort=%s, use_web=%s)",
-                            message.model, _MODEL, _EFFORT, use_web,
+                            message.model,
+                            _MODEL,
+                            _EFFORT,
+                            use_web,
                         )
                         model_logged = True
                 # Primary signal: the assistant-message error enum from the SDK.
                 if isinstance(message, AssistantMessage) and message.error in (
-                    "rate_limit", "billing_error"
+                    "rate_limit",
+                    "billing_error",
                 ):
                     raise ClaudeUsageLimitError(message.error)
                 if isinstance(message, ResultMessage):
@@ -120,15 +130,28 @@ async def _ask_claude(
                         _looks_like_limit(message.subtype)
                         or _looks_like_limit(message.result)
                     ):
-                        subtype = message.subtype or message.stop_reason or "result_error"
+                        subtype = (
+                            message.subtype or message.stop_reason or "result_error"
+                        )
                         raise ClaudeUsageLimitError(subtype)
                     if message.is_error:
                         # Other result errors: surface the subtype for visibility.
                         logger.warning(
                             "Claude result error (subtype=%s, stop_reason=%s)",
-                            message.subtype, message.stop_reason,
+                            message.subtype,
+                            message.stop_reason,
                         )
-                    result = message.result
+                    # When output_format=json_schema is used, the SDK puts the
+                    # validated object in `structured_output` and `result` is
+                    # empty / a status string ("structured output submitted…").
+                    # Serialize structured_output back to JSON text so callers
+                    # that json.loads() the return keep working. Fall back to the
+                    # plain text result for non-schema calls.
+                    structured = getattr(message, "structured_output", None)
+                    if structured is not None:
+                        result = json.dumps(structured, ensure_ascii=False)
+                    else:
+                        result = message.result
 
         try:
             await asyncio.wait_for(_collect(), timeout=timeout)
@@ -143,7 +166,8 @@ async def _ask_claude(
         except asyncio.TimeoutError:
             logger.warning(
                 "Claude call timed out after %ds (use_web=%s), closing generator",
-                timeout, use_web,
+                timeout,
+                use_web,
             )
             # Explicitly close the async generator to kill the subprocess
             try:
@@ -165,7 +189,9 @@ async def _ask_claude(
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=2,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def resolve_company_name(
     company_name: str,
@@ -212,7 +238,9 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 
 
 @with_retry(
-    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=3,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def disambiguate(
     original_name: str,
@@ -267,7 +295,9 @@ If none are a good match, use index: -1."""
 
 
 @with_retry(
-    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=3,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def generate_career_summary(
     ceo_name: str,
@@ -294,7 +324,9 @@ Write in third person. Be concise and factual."""
 
 def _extract_linkedin_url(text: str) -> str | None:
     """Extract a LinkedIn profile URL from text."""
-    match = re.search(r'https?://(?:[a-z]{2,3}\.)?linkedin\.com/in/[^\s\)"\]\',]+', text)
+    match = re.search(
+        r'https?://(?:[a-z]{2,3}\.)?linkedin\.com/in/[^\s\)"\]\',]+', text
+    )
     return match.group(0).rstrip(".,;:") if match else None
 
 
@@ -338,7 +370,9 @@ def _try_parse_json(text: str) -> dict | None:
 
 
 @with_retry(
-    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=3,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def research_ceo(
     ceo_name: str,
@@ -389,7 +423,9 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 
 
 @with_retry(
-    max_attempts=3, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=3,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def extract_ceo_from_text(
     company_name: str,
@@ -433,7 +469,9 @@ If no leader can be identified, use null values."""
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=2,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def discover_ceo(
     company_name: str,
@@ -489,7 +527,9 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=2,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def enrich_missing_financials(
     company_name: str,
@@ -534,10 +574,16 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
     # Fallback: try to extract numbers from text
     if result:
         data = {}
-        emp_match = re.search(r"(\d[\d,.']+)\s*(?:employees|Mitarbeiter|staff|people)", result, re.I)
+        emp_match = re.search(
+            r"(\d[\d,.']+)\s*(?:employees|Mitarbeiter|staff|people)", result, re.I
+        )
         if emp_match:
             data["employees_count"] = emp_match.group(1).replace("'", ",")
-        rev_match = re.search(r"(?:revenue|turnover|Umsatz)[:\s]*([€$£]\s*[\d.,]+\s*[BMKbmk]?(?:illion)?)", result, re.I)
+        rev_match = re.search(
+            r"(?:revenue|turnover|Umsatz)[:\s]*([€$£]\s*[\d.,]+\s*[BMKbmk]?(?:illion)?)",
+            result,
+            re.I,
+        )
         if rev_match:
             data["revenue"] = rev_match.group(1).strip()
         if data:
@@ -549,86 +595,31 @@ You MUST respond with ONLY a JSON object in this exact format (no markdown, no e
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=2,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
-async def enrich_company(
+async def summarize_business(
     company_name: str,
     country: str | None = None,
     legal_form: str | None = None,
-    known_ceo_name: str | None = None,
-    known_ceo_title: str | None = None,
-    known_revenue: str | None = None,
-    known_employees: str | None = None,
 ) -> dict:
-    """One merged web-search call: CEO + financials + business description.
+    """Web-search call #1: a short business description only.
 
-    Replaces the previous per-company chain of research_ceo/discover_ceo +
-    enrich_missing_financials + estimate_employee_count +
-    summarize_corporate_structure with a single Agent SDK call. Confirms/enriches
-    data we already have and fills gaps; tells Claude to use null for anything it
-    cannot verify so good Northdata data is never overwritten by guesses.
-
-    Returns a dict shaped like::
-
-        {
-          "ceo": {"name", "title", "linkedin_url", "career_summary"},
-          "financials": {"employees_count", "revenue", "total_assets"},
-          "business_description": str | None,
-          "source_notes": str | None,
-        }
-
-    On parse failure, returns the same shape with empty sub-dicts / None values.
+    Deliberately narrow so it finishes within the turn budget. Returns
+    {"business_description": str|None, "raw": str}.
     """
-    # --- Build conditional context blocks ---
-    ceo_context = (
-        f'The known managing director / CEO is "{known_ceo_name}"'
-        f'{f" ({known_ceo_title})" if known_ceo_title else ""}. '
-        "Confirm this person, find their LinkedIn profile URL, and write a "
-        "2-3 sentence career summary."
-        if known_ceo_name
-        else (
-            "Find the current CEO, Geschäftsführer, or managing director, their "
-            "title, LinkedIn profile URL, and a 2-3 sentence career summary."
-        )
-    )
-
     location = f" The company is based in {country}." if country else ""
+    form = f" Legal form: {legal_form}." if legal_form else ""
 
-    kg_hint = ""
-    if legal_form and "co. kg" in legal_form.lower():
-        kg_hint = (
-            " This is a GmbH & Co. KG structure — the actual Geschäftsführer is "
-            "typically the managing director of the Komplementär-GmbH "
-            "(Verwaltungsgesellschaft / general partner)."
-        )
+    prompt = f"""Research the company "{company_name}".{location}{form}
 
-    known_fin = []
-    if known_revenue:
-        known_fin.append(f"revenue is approximately {known_revenue}")
-    if known_employees:
-        known_fin.append(f"employee count is approximately {known_employees}")
-    known_fin_text = (
-        " Already known (do not contradict, only fill what is missing): "
-        + "; ".join(known_fin)
-        + "."
-        if known_fin
-        else ""
-    )
+Write a 2-4 sentence professional business description: what the company does,
+its industry/sector, and its scale. Suitable for a business research report.
+Only state things you can verify from search results; if you find very little,
+write a brief description based on the name and any available information.
 
-    prompt = f"""Research the company "{company_name}".{location}{kg_hint}
-
-Gather three things in a single pass:
-
-1. LEADERSHIP: {ceo_context}
-2. FINANCIALS: employee count, revenue/turnover (most recent available), and
-   total assets if available.{known_fin_text} Look at the company website,
-   LinkedIn page, annual reports, business registries, and press releases.
-3. BUSINESS DESCRIPTION: a 2-4 sentence professional summary of the business —
-   what it does, its scale (revenue/employees), corporate structure, and who
-   leads it. Suitable for a business research report.
-
-Only include data you can actually verify from search results. Use null for any
-field you cannot find. Do not guess."""
+Respond with ONLY a JSON object (no markdown): {{"business_description": "..."}}"""
 
     result = await _ask_claude(
         prompt=prompt,
@@ -638,98 +629,190 @@ field you cannot find. Do not guess."""
             "schema": {
                 "type": "object",
                 "properties": {
-                    "ceo": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": ["string", "null"]},
-                            "title": {"type": ["string", "null"]},
-                            "linkedin_url": {"type": ["string", "null"]},
-                            "career_summary": {"type": ["string", "null"]},
-                        },
-                        "required": ["name", "title", "linkedin_url", "career_summary"],
-                        "additionalProperties": False,
-                    },
-                    "financials": {
-                        "type": "object",
-                        "properties": {
-                            "employees_count": {"type": ["string", "null"]},
-                            "revenue": {"type": ["string", "null"]},
-                            "total_assets": {"type": ["string", "null"]},
-                        },
-                        "required": ["employees_count", "revenue", "total_assets"],
-                        "additionalProperties": False,
-                    },
                     "business_description": {"type": ["string", "null"]},
-                    "source_notes": {"type": ["string", "null"]},
                 },
-                "required": ["ceo", "financials", "business_description", "source_notes"],
+                "required": ["business_description"],
                 "additionalProperties": False,
             },
         },
     )
 
     raw = result or ""
+    parsed = _try_parse_json(result)
+    if isinstance(parsed, dict) and parsed.get("business_description"):
+        return {"business_description": parsed["business_description"], "raw": raw}
 
-    empty = {
-        "ceo": {"name": None, "title": None, "linkedin_url": None, "career_summary": None},
-        "financials": {"employees_count": None, "revenue": None, "total_assets": None},
-        "business_description": None,
-        "source_notes": None,
+    # Fallback: salvage prose from a non-JSON response.
+    if raw.strip():
+        salvaged = _strip_markdown(raw)
+        if len(salvaged) > 1000:
+            salvaged = salvaged[:997] + "..."
+        return {"business_description": salvaged or None, "raw": raw}
+
+    logger.warning(
+        "summarize_business: empty/unparseable response for '%s' (len=%d)",
+        company_name,
+        len(raw),
+    )
+    return {"business_description": None, "raw": raw}
+
+
+@with_retry(
+    max_attempts=2,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
+)
+async def research_leadership(
+    company_name: str,
+    country: str | None = None,
+    legal_form: str | None = None,
+    known_ceo_name: str | None = None,
+    known_ceo_title: str | None = None,
+) -> dict:
+    """Web-search call #2: the CEO / legal representative only.
+
+    Narrow so it finishes within the turn budget. Returns
+    {"name", "title", "linkedin_url", "career_summary", "raw"}.
+    """
+    location = f" The company is based in {country}." if country else ""
+
+    kg_hint = ""
+    if legal_form and "co. kg" in legal_form.lower():
+        kg_hint = (
+            " This is a GmbH & Co. KG — the actual Geschäftsführer is typically "
+            "the managing director of the Komplementär-GmbH (general partner)."
+        )
+
+    if known_ceo_name:
+        task = (
+            f'The known managing director / CEO is "{known_ceo_name}"'
+            f'{f" ({known_ceo_title})" if known_ceo_title else ""}. Confirm this '
+            "person, find their LinkedIn profile URL, and write a 2-3 sentence "
+            "career summary."
+        )
+    else:
+        task = (
+            "Find the current CEO, Geschäftsführer, or managing director: their "
+            "name, title, LinkedIn profile URL, and a 2-3 sentence career summary."
+        )
+
+    prompt = f"""Research the leadership of "{company_name}".{location}{kg_hint}
+
+{task}
+
+Use null for anything you cannot verify. Do not guess.
+Respond with ONLY a JSON object (no markdown):
+{{"name": "..." or null, "title": "..." or null, "linkedin_url": "..." or null, "career_summary": "..." or null}}"""
+
+    result = await _ask_claude(
+        prompt=prompt,
+        use_web=True,
+        output_format={
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": ["string", "null"]},
+                    "title": {"type": ["string", "null"]},
+                    "linkedin_url": {"type": ["string", "null"]},
+                    "career_summary": {"type": ["string", "null"]},
+                },
+                "required": ["name", "title", "linkedin_url", "career_summary"],
+                "additionalProperties": False,
+            },
+        },
+    )
+
+    raw = result or ""
+    parsed = _try_parse_json(result)
+    if isinstance(parsed, dict):
+        return {
+            "name": parsed.get("name"),
+            "title": parsed.get("title"),
+            "linkedin_url": parsed.get("linkedin_url"),
+            "career_summary": parsed.get("career_summary"),
+            "raw": raw,
+        }
+
+    # Fallback: at least try to pull a LinkedIn URL from prose.
+    if not raw.strip():
+        logger.warning(
+            "research_leadership: empty/unparseable response for '%s' (len=%d)",
+            company_name,
+            len(raw),
+        )
+    return {
+        "name": None,
+        "title": None,
+        "linkedin_url": _extract_linkedin_url(raw) if raw else None,
+        "career_summary": None,
         "raw": raw,
     }
 
-    parsed = _try_parse_json(result)
-    if not isinstance(parsed, dict):
-        # Parse failed. If there is non-empty prose, salvage a business
-        # description (+ LinkedIn) from it instead of discarding everything.
-        if raw.strip():
-            salvaged = _strip_markdown(raw)
-            if len(salvaged) > 1000:
-                salvaged = salvaged[:997] + "..."
-            logger.info(
-                "enrich_company: non-JSON response for '%s' — salvaged %d chars of prose",
-                company_name, len(salvaged),
-            )
-            return {
-                "ceo": {
-                    "name": None, "title": None,
-                    "linkedin_url": _extract_linkedin_url(raw),
-                    "career_summary": None,
-                },
-                "financials": {"employees_count": None, "revenue": None, "total_assets": None},
-                "business_description": salvaged or None,
-                "source_notes": None,
-                "raw": raw,
-            }
-        logger.warning(
-            "enrich_company: empty/unparseable response for '%s' (len=%d)",
-            company_name, len(raw),
-        )
-        return empty
 
-    # Merge onto the empty skeleton so callers always get the full shape.
-    ceo = parsed.get("ceo") or {}
-    fin = parsed.get("financials") or {}
+async def enrich_company(
+    company_name: str,
+    country: str | None = None,
+    legal_form: str | None = None,
+    known_ceo_name: str | None = None,
+    known_ceo_title: str | None = None,
+    known_revenue: str | None = None,  # kept for call-site compatibility; unused
+    known_employees: str | None = None,  # kept for call-site compatibility; unused
+) -> dict:
+    """Orchestrate the two focused web calls: business summary + leadership.
+
+    Split out of a single mega-call because, at high effort, one call asking for
+    leadership + financials + description launched too many web searches and ran
+    out of turns before answering (empty result). Each focused call finishes
+    within budget. Financials are NO LONGER requested from Claude — Northdata is
+    the source of truth for those.
+
+    Returns the same shape callers already use::
+
+        {
+          "ceo": {"name", "title", "linkedin_url", "career_summary"},
+          "business_description": str | None,
+          "raw": str,            # combined raw text from both calls
+        }
+    """
+    summary = await summarize_business(
+        company_name=company_name,
+        country=country,
+        legal_form=legal_form,
+    )
+    leadership = await research_leadership(
+        company_name=company_name,
+        country=country,
+        legal_form=legal_form,
+        known_ceo_name=known_ceo_name,
+        known_ceo_title=known_ceo_title,
+    )
+
+    combined_raw = "\n\n".join(
+        part
+        for part in (
+            f"[business]\n{summary.get('raw', '')}".strip(),
+            f"[leadership]\n{leadership.get('raw', '')}".strip(),
+        )
+        if part
+    )
+
     return {
         "ceo": {
-            "name": ceo.get("name"),
-            "title": ceo.get("title"),
-            "linkedin_url": ceo.get("linkedin_url"),
-            "career_summary": ceo.get("career_summary"),
+            "name": leadership.get("name"),
+            "title": leadership.get("title"),
+            "linkedin_url": leadership.get("linkedin_url"),
+            "career_summary": leadership.get("career_summary"),
         },
-        "financials": {
-            "employees_count": fin.get("employees_count"),
-            "revenue": fin.get("revenue"),
-            "total_assets": fin.get("total_assets"),
-        },
-        "business_description": parsed.get("business_description"),
-        "source_notes": parsed.get("source_notes"),
-        "raw": raw,
+        "business_description": summary.get("business_description"),
+        "raw": combined_raw,
     }
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=2,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def estimate_employee_count(
     company_name: str,
@@ -772,7 +855,9 @@ You MUST respond with ONLY a JSON object (no markdown, no explanation):
 
     # Fallback: extract number from text
     if result:
-        match = re.search(r"(\d[\d,.']+)\s*(?:employees|Mitarbeiter|staff|people)", result, re.I)
+        match = re.search(
+            r"(\d[\d,.']+)\s*(?:employees|Mitarbeiter|staff|people)", result, re.I
+        )
         if match:
             return match.group(1).replace("'", ",")
 
@@ -780,7 +865,9 @@ You MUST respond with ONLY a JSON object (no markdown, no explanation):
 
 
 @with_retry(
-    max_attempts=2, base_delay=2.0, exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError)
+    max_attempts=2,
+    base_delay=2.0,
+    exceptions=(CLIConnectionError, ProcessError, ClaudeTimeoutError),
 )
 async def summarize_corporate_structure(
     company_name: str,
@@ -806,11 +893,15 @@ async def summarize_corporate_structure(
     if employees:
         facts.append(f"Employees: {employees}")
     if ceo_name:
-        facts.append(f"CEO/Managing Director: {ceo_name} ({ceo_title or 'unknown title'})")
+        facts.append(
+            f"CEO/Managing Director: {ceo_name} ({ceo_title or 'unknown title'})"
+        )
 
     if related_entities:
         for entity in related_entities:
-            parts = [f"Related entity: {entity.get('name', '?')} (role: {entity.get('role', '?')})"]
+            parts = [
+                f"Related entity: {entity.get('name', '?')} (role: {entity.get('role', '?')})"
+            ]
             if entity.get("legal_form"):
                 parts.append(f"legal form: {entity['legal_form']}")
             if entity.get("ceo_found"):

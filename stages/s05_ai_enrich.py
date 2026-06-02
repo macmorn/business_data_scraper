@@ -165,9 +165,9 @@ async def _enrich_company(
             await _disambiguate_company(company, raw["matches"], clie, rate_limiter)
             results["disambiguated"] += 1
 
-    # Single merged enrichment call: CEO + financials + business description.
-    # Replaces the former research_ceo/discover_ceo + enrich_missing_financials
-    # + estimate_employee_count + summarize_corporate_structure chain.
+    # Two focused Claude web calls (orchestrated by enrich_company):
+    #   1. business description  2. leadership (CEO/Geschäftsführer)
+    # Financials are NOT requested from Claude — Northdata is the source for them.
     cname = company.matched_name or company.name_original
 
     had_ceo_name = bool(company.ceo_name)
@@ -179,19 +179,17 @@ async def _enrich_company(
             legal_form=company.legal_form,
             known_ceo_name=company.ceo_name,
             known_ceo_title=company.ceo_current_title,
-            known_revenue=company.revenue,
-            known_employees=company.employees_count or company.employees_range,
         )
     except claude_ai.ClaudeUsageLimitError:
         raise
     except Exception as e:
-        logger.warning("Merged enrichment failed for '%s': %s", company.name_original, e)
+        logger.warning("AI enrichment failed for '%s': %s", company.name_original, e)
         return
 
     ceo = data.get("ceo") or {}
-    fin = data.get("financials") or {}
+    enriched_something = False
 
-    # --- Apply CEO ---
+    # --- Apply CEO / leadership ---
     if had_ceo_name:
         # We already had a name (from registry/structure stages): only enrich.
         if ceo.get("career_summary"):
@@ -200,6 +198,7 @@ async def _enrich_company(
             company.ceo_linkedin_url = ceo["linkedin_url"]
         if company.ceo_career_summary:
             results["summary_generated"] += 1
+            enriched_something = True
     elif ceo.get("name"):
         # Newly discovered CEO.
         company.ceo_name = ceo["name"]
@@ -208,31 +207,17 @@ async def _enrich_company(
         company.ceo_linkedin_url = ceo.get("linkedin_url")
         company.ceo_confidence = "medium"
         results["ceo_discovered"] += 1
+        enriched_something = True
         logger.info("  Discovered CEO for '%s': %s", company.name_original, company.ceo_name)
-
-    # --- Apply financials (only fill gaps) ---
-    filled_financials = False
-    if fin.get("revenue") and not company.revenue:
-        company.revenue = fin["revenue"]
-        if not company.revenue_range:
-            company.revenue_range = fin["revenue"]
-        filled_financials = True
-    if fin.get("employees_count") and not company.employees_count:
-        company.employees_count = fin["employees_count"]
-        if not company.employees_range:
-            company.employees_range = fin["employees_count"]
-        filled_financials = True
-    if fin.get("total_assets") and not company.total_assets:
-        company.total_assets = fin["total_assets"]
-        filled_financials = True
-    if filled_financials:
-        _append_source(company, "claude_web")
-        results["financials_enriched"] += 1
 
     # --- Apply business description -> corporate structure summary (gap-fill) ---
     # S04b may have already written a richer related-entity summary; don't clobber it.
     if not company.corporate_structure_summary and data.get("business_description"):
         company.corporate_structure_summary = data["business_description"]
+        enriched_something = True
+
+    if enriched_something:
+        _append_source(company, "claude_web")
 
     # --- Preserve the raw Claude output (don't lose it on parse failure) ---
     raw = (data.get("raw") or "").strip()
@@ -254,7 +239,6 @@ async def _enrich_company(
         not data.get("business_description")
         and not (data.get("ceo") or {}).get("name")
         and not (data.get("ceo") or {}).get("career_summary")
-        and not any((data.get("financials") or {}).values())
         and not raw
     )
     has_any_real_data = bool(
