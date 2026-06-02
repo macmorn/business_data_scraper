@@ -139,19 +139,33 @@ class NorthdataClient:
             await page.keyboard.type(self._password, delay=random.randint(25, 70))
             await _human_delay(page, 300, 800)
 
-            # Submit
+            # Submit. A successful login POST triggers a navigation (redirect to
+            # the homepage), so wait for it — otherwise we'd check the page while
+            # it's still the login form and wrongly conclude login failed.
             submit_btn = await page.query_selector('button[type="submit"]')
-            if submit_btn:
-                await _human_mouse_move(page)
-                await submit_btn.click()
-            else:
-                await pw_input.press("Enter")
+            try:
+                async with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    if submit_btn:
+                        await _human_mouse_move(page)
+                        await submit_btn.click()
+                    else:
+                        await pw_input.press("Enter")
+            except Exception:
+                # No navigation fired (some flows update in place); fall through
+                # and verify by content with a short poll below.
+                pass
 
-            await _human_delay(page, 2500, 4000)
+            # Verify login succeeded. Logged-in pages carry a logout link and a
+            # "My Account" entry. Poll briefly to absorb redirect/render timing.
+            logged_in = False
+            for _ in range(6):
+                content = (await page.content()).lower()
+                if "_logout" in content or "logout" in content or "my account" in content:
+                    logged_in = True
+                    break
+                await page.wait_for_timeout(1000)
 
-            # Verify login succeeded
-            content = await page.content()
-            if "logout" in content.lower() or "_logout" in content:
+            if logged_in:
                 self._logged_in = True
                 logger.info("Successfully logged in to Northdata as %s", self._email)
             else:
