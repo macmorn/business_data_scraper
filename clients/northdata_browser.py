@@ -183,13 +183,24 @@ class NorthdataClient:
             await page.close()
 
     async def stop(self) -> None:
-        """Close the browser."""
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._pw:
-            await self._pw.stop()
+        """Close the browser. Best-effort: normal close failures are swallowed.
+
+        Each close step is guarded so a failure in one (e.g. context already
+        gone) doesn't skip the others. CancelledError is NOT swallowed here — a
+        genuine task cancellation should still propagate; callers that must keep
+        a propagating usage-limit error intact guard stop() themselves.
+        """
+        for label, closer in (
+            ("context", self._context),
+            ("browser", self._browser),
+            ("playwright", self._pw),
+        ):
+            if not closer:
+                continue
+            try:
+                await (closer.stop() if label == "playwright" else closer.close())
+            except Exception as e:  # noqa: BLE001 - close is best-effort
+                logger.warning("Northdata %s close failed: %r", label, e)
         logger.info("Northdata browser closed")
 
     async def search(self, company_name: str, search_hint: str | None = None) -> dict:

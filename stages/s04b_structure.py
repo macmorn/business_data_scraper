@@ -55,6 +55,7 @@ async def run() -> None:
         await client.start()
         rate_limiter = RateLimiter(config.NORTHDATA_DELAY_MIN, config.NORTHDATA_DELAY_MAX)
 
+    usage_limit_error = None
     try:
         for company in companies:
             try:
@@ -142,10 +143,10 @@ async def run() -> None:
                     company.id, f"usage_limit_reached:{e.subtype}", STAGE_PENDING_STRUCTURE
                 )
                 results["error"] += 1
-                tracker.summary(results)
-                # Re-raise so the caller can hibernate + resume; remaining
-                # companies stay at pending_structure and are picked up on retry.
-                raise
+                # Capture + stop; re-raise AFTER the finally so browser teardown
+                # can't mask this error before the hibernation wrapper sees it.
+                usage_limit_error = e
+                break
             except Exception as e:
                 logger.error("Structure traversal error for '%s': %s", company.name_original, e)
                 db.mark_failed(company.id, str(e))
@@ -153,9 +154,18 @@ async def run() -> None:
 
     finally:
         if client:
-            await client.stop()
+            # Best-effort teardown; never let it mask a propagating usage-limit
+            # error (the SDK cancel scope can turn stop() into a CancelledError).
+            try:
+                await client.stop()
+            except BaseException as e:  # noqa: BLE001 - teardown must not raise
+                logger.warning("Northdata client stop() during Stage 4b teardown failed: %r", e)
 
     tracker.summary(results)
+
+    # Re-raise the usage limit AFTER cleanup so the hibernation wrapper gets it intact.
+    if usage_limit_error is not None:
+        raise usage_limit_error
 
 
 def _get_entity_officers(company) -> list[dict]:

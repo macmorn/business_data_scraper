@@ -72,6 +72,7 @@ async def run() -> None:
     _COMPANY_TIMEOUT = 600  # 10 min safety net per company
     source_run = Path(config.INPUT_PDF).stem
 
+    usage_limit_error = None
     try:
         for index, company in enumerate(companies):
             try:
@@ -113,11 +114,12 @@ async def run() -> None:
                     company.name_original, e.subtype,
                     len(remaining), len(companies), STAGE_PENDING_AI,
                 )
-                tracker.summary(results)
-                # Re-raise so the caller can hibernate + resume the parked work.
-                # (Remaining companies stay at pending_ai; re-running this stage
-                # continues them.)
-                raise
+                # Capture and stop the loop. We re-raise AFTER the finally below
+                # so that browser teardown (which the Claude SDK's cancel scope
+                # may turn into a CancelledError) can't replace/mask this error
+                # before it reaches the hibernation wrapper.
+                usage_limit_error = e
+                break
             except asyncio.TimeoutError:
                 logger.error(
                     "Company '%s' enrichment timed out after %ds, moving on",
@@ -131,9 +133,21 @@ async def run() -> None:
                 results["error"] += 1
     finally:
         if client:
-            await client.stop()
+            # Best-effort teardown. The Claude SDK's anyio cancel scope can
+            # cancel this task during unwind, turning client.stop() into a
+            # CancelledError (a BaseException). Swallow ALL of it so cleanup can
+            # never mask a propagating ClaudeUsageLimitError.
+            try:
+                await client.stop()
+            except BaseException as e:  # noqa: BLE001 - teardown must not raise
+                logger.warning("Northdata client stop() during Stage 5 teardown failed: %r", e)
 
     tracker.summary(results)
+
+    # Re-raise the usage limit AFTER cleanup, on a clean stack, so the
+    # hibernation wrapper receives it intact and can sleep + resume.
+    if usage_limit_error is not None:
+        raise usage_limit_error
 
 
 async def _enrich_company(
