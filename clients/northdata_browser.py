@@ -456,6 +456,8 @@ class NorthdataClient:
             # Parse structured tables
             tables = await page.query_selector_all("table")
 
+            financials_parsed = False  # only the summary KPI table, parsed once
+
             for table in tables:
                 cls = await table.get_attribute("class") or ""
 
@@ -463,15 +465,37 @@ class NorthdataClient:
                 if "company-representatives" in cls:
                     data["officers"] = await self._parse_representatives_table(table)
 
-                # Financials KPI table (first .bizq table with "Financials" header)
+                # Financials tables are .bizq. A page can carry several:
+                #   - the summary KPI table (Revenue, Earnings, Equity ratio, …)
+                #   - a detailed balance-sheet breakdown (Assets, A. Fixed assets, …)
+                #   - a Mktg & Tech table (public funding)
+                # The KPI table is NOT always titled "Financials" (English-localised
+                # pages have a bare date/“EUR” header row), so detect it by content:
+                # its distinctive summary metrics (Revenue / Return on sales / CAGR).
+                # We must NOT parse the balance-sheet table as KPI — its “Assets”/
+                # “Liabilities and equity” rows would pollute the KPI values.
                 elif "bizq" in cls:
                     rows = await table.query_selector_all("tr")
-                    if rows:
-                        first_row = await rows[0].inner_text()
-                        if "Financials" in first_row or "Finanzkennzahlen" in first_row:
-                            await self._parse_financials_table(rows, data)
-                        elif "Mktg" in first_row or "Marketing" in first_row:
-                            await self._parse_mktg_table(rows, data)
+                    if not rows:
+                        continue
+                    table_text = await table.inner_text()
+                    first_row = await rows[0].inner_text()
+
+                    is_kpi = (
+                        "Financials" in first_row
+                        or "Finanzkennzahlen" in first_row
+                        or "Revenue" in table_text
+                        or "Umsatz" in table_text
+                        or "Return on sales" in table_text
+                        or "CAGR" in table_text
+                    )
+                    is_mktg = "Mktg" in first_row or "Marketing" in first_row
+
+                    if is_kpi and not financials_parsed:
+                        await self._parse_financials_table(rows, data)
+                        financials_parsed = True
+                    elif is_mktg:
+                        await self._parse_mktg_table(rows, data)
 
         except Exception as e:
             logger.error("Error scraping company page %s: %s", page.url, e)
