@@ -37,6 +37,7 @@ from pathlib import Path
 import config
 from clients.northdata_browser import NorthdataClient, NorthdataLoginError
 from stages.s02_northdata import apply_company_data
+from stages.s04_ceo_lookup import _extract_ceo_from_officers
 from stages.s06_normalize import _parse_money, _parse_employee_count, EMPLOYEE_BUCKETS
 from utils.rate_limiter import RateLimiter
 
@@ -67,6 +68,7 @@ class _Row:
         "auditor", "financials_json", "public_funding_total", "corporate_purpose",
         "industry_code", "officers", "data_sources_used", "northdata_raw",
         "revenue_notes", "employees_notes",
+        "ceo_name", "ceo_current_title", "ceo_confidence",
     )
 
     def __init__(self, row: sqlite3.Row):
@@ -114,6 +116,7 @@ _UPDATE_COLS = (
     "pension_provisions", "auditor", "financials_json", "public_funding_total",
     "corporate_purpose", "industry_code", "officers", "data_sources_used",
     "northdata_raw", "revenue_notes", "employees_notes",
+    "ceo_name", "ceo_current_title", "ceo_confidence",
 )
 
 
@@ -166,6 +169,19 @@ async def refetch_db(
 
             had_fin = _has_financials(rec)
             apply_company_data(rec, scraped)
+
+            # Derive the CEO / legal representative from the freshly-scraped
+            # officers — apply_company_data only stores the raw officers list; the
+            # structured ceo_* columns are normally filled by Stage 4. Mirror that
+            # here, but only when the row has no CEO yet (preserve an existing one,
+            # e.g. AI-discovered). Same precedent as the S05 disambiguation path.
+            if not (rec.ceo_name or "").strip():
+                ceo = _extract_ceo_from_officers(rec.officers)
+                if ceo and ceo.get("name"):
+                    rec.ceo_name = ceo["name"]
+                    rec.ceo_current_title = ceo.get("role")
+                    rec.ceo_confidence = "high"
+
             # Tag source + keep a raw copy for traceability.
             src = rec.data_sources_used or ""
             if "northdata" not in src:
@@ -187,8 +203,9 @@ async def refetch_db(
             if now_fin and not had_fin:
                 gained += 1
             logger.info(
-                "  %s | revenue=%s | employees=%s | %s",
+                "  %s | revenue=%s | employees=%s | ceo=%s | %s",
                 rec.name_original[:40], rec.revenue or "?", rec.employees_count or "?",
+                rec.ceo_name or "?",
                 "GAINED financials" if (now_fin and not had_fin) else "updated",
             )
         return eligible, updated, gained
