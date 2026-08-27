@@ -234,7 +234,7 @@ def get_all_for_export() -> list[CompanyRecord]:
     """Fetch all completed companies for CSV export."""
     with _get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM companies WHERE stage IN (?, ?)",
+            "SELECT * FROM companies WHERE stage IN (?, ?) ORDER BY id",
             ("pending_export", "done"),
         ).fetchall()
     return [_row_to_record(row) for row in rows]

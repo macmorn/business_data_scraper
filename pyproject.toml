@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 run-pipeline = "pipeline:main"
+export-ready = "export_ready:main"
 
 [dependency-groups]
 dev = [

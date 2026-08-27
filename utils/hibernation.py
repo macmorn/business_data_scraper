@@ -25,6 +25,58 @@ logger = logging.getLogger(__name__)
 DEFAULT_HIBERNATE_SECONDS = 600  # 10 minutes
 
 
+def _looks_like_claude_cleanup_cancel(error: asyncio.CancelledError) -> bool:
+    """True for the Claude SDK async-generator cleanup cancellation leak."""
+    text = repr(error)
+    return "async_generator_athrow" in text
+
+
+def _clear_current_task_cancel() -> None:
+    """Clear a cancellation request after a known non-user cleanup leak."""
+    task = asyncio.current_task()
+    if not task:
+        return
+    while task.cancelling():
+        task.uncancel()
+
+
+async def _sleep_hibernating(seconds: int, *, label: str) -> None:
+    """Sleep, ignoring only Claude SDK cleanup cancellations."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    cleanup_cancel_seen = False
+
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.sleep(remaining)
+            return
+        except KeyboardInterrupt:
+            logger.warning(
+                "%s hibernation aborted by user; remaining work stays parked.",
+                label,
+            )
+            raise
+        except asyncio.CancelledError as e:
+            if _looks_like_claude_cleanup_cancel(e):
+                _clear_current_task_cancel()
+                if not cleanup_cancel_seen:
+                    logger.warning(
+                        "%s hibernation sleep was interrupted by Claude SDK "
+                        "cleanup cancellation; continuing to hibernate.",
+                        label,
+                    )
+                    cleanup_cancel_seen = True
+                continue
+            logger.warning(
+                "%s hibernation aborted by user; remaining work stays parked.",
+                label,
+            )
+            raise
+
+
 async def run_with_hibernation(
     step: Callable[[], Awaitable[object]],
     *,
@@ -58,9 +110,5 @@ async def run_with_hibernation(
                 "(Ctrl-C to abort)",
                 label, e.subtype, attempt, mins,
             )
-            try:
-                await asyncio.sleep(hibernate_seconds)
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                logger.warning("%s hibernation aborted by user; remaining work stays parked.", label)
-                raise
+            await _sleep_hibernating(hibernate_seconds, label=label)
             logger.info("%s resuming after hibernation (attempt %d)…", label, attempt + 1)

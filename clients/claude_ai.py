@@ -12,7 +12,7 @@ import logging
 import re
 
 from claude_agent_sdk import (
-    query,
+    ClaudeSDKClient,
     ClaudeAgentOptions,
     AssistantMessage,
     CLIConnectionError,
@@ -58,6 +58,7 @@ _TIMEOUT_PLAIN = 60  # text generation only
 
 # Substrings that mark a usage/rate/billing limit in SDK error text.
 _LIMIT_MARKERS = ("usage limit", "rate limit", "rate_limit", "billing")
+_CLIENT_DISCONNECT_TIMEOUT = 10
 
 
 def _looks_like_limit(text: str | None) -> bool:
@@ -66,6 +67,39 @@ def _looks_like_limit(text: str | None) -> bool:
         return False
     low = text.lower()
     return any(marker in low for marker in _LIMIT_MARKERS)
+
+
+async def _disconnect_claude_client(
+    client: ClaudeSDKClient,
+    *,
+    reason: str,
+    propagate_cancel: bool = True,
+) -> None:
+    """Disconnect a Claude SDK client without creating a separate asyncio task.
+
+    The SDK's anyio cancel scopes are task-affine. Cleanup must stay in the task
+    that connected and consumed the client, otherwise the SDK can raise:
+    "Attempted to exit cancel scope in a different task than it was entered in".
+    `asyncio.timeout()` enforces a deadline while staying in the current task.
+    """
+    try:
+        async with asyncio.timeout(_CLIENT_DISCONNECT_TIMEOUT):
+            await client.disconnect()
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Claude client disconnect timed out after %ds during %s",
+            _CLIENT_DISCONNECT_TIMEOUT,
+            reason,
+        )
+    except asyncio.CancelledError:
+        logger.warning("Claude client disconnect was cancelled during %s", reason)
+        if propagate_cancel:
+            raise
+        task = asyncio.current_task()
+        if task and task.cancelling():
+            task.uncancel()
+    except Exception as e:
+        logger.warning("Claude client disconnect failed during %s: %r", reason, e)
 
 
 async def _ask_claude(
@@ -100,12 +134,26 @@ async def _ask_claude(
 
     async with _semaphore:
         result = ""
-        gen = query(prompt=prompt, options=options)
+        client = ClaudeSDKClient(options=options)
+        client_disconnected = False
+
+        async def _disconnect(reason: str, *, propagate_cancel: bool = True) -> None:
+            nonlocal client_disconnected
+            if client_disconnected:
+                return
+            await _disconnect_claude_client(
+                client,
+                reason=reason,
+                propagate_cancel=propagate_cancel,
+            )
+            client_disconnected = True
 
         async def _collect() -> None:
             nonlocal result
             model_logged = False
-            async for message in gen:
+            await client.connect()
+            await client.query(prompt)
+            async for message in client.receive_response():
                 # Record the model the SDK actually served (once per call), so
                 # pipeline.log shows which model handled each request rather than
                 # only the requested alias (_MODEL).
@@ -154,36 +202,40 @@ async def _ask_claude(
                         result = message.result
 
         try:
-            await asyncio.wait_for(_collect(), timeout=timeout)
+            # Keep collection in this task. `asyncio.wait_for(_collect(), ...)`
+            # runs `_collect()` in a child task, but the Claude SDK client must
+            # be disconnected by the same task that consumed it.
+            async with asyncio.timeout(timeout):
+                await _collect()
         except ClaudeUsageLimitError as e:
             logger.error("Claude usage limit reached (subtype=%s)", e.subtype)
-            # Close the generator to kill the subprocess, then propagate.
-            try:
-                await asyncio.wait_for(gen.aclose(), timeout=10)
-            except (asyncio.TimeoutError, Exception):
-                pass
+            await _disconnect(
+                reason="usage-limit handling",
+                propagate_cancel=False,
+            )
             raise
         except asyncio.TimeoutError:
             logger.warning(
-                "Claude call timed out after %ds (use_web=%s), closing generator",
+                "Claude call timed out after %ds (use_web=%s), disconnecting client",
                 timeout,
                 use_web,
             )
-            # Explicitly close the async generator to kill the subprocess
-            try:
-                await asyncio.wait_for(gen.aclose(), timeout=10)
-            except (asyncio.TimeoutError, Exception):
-                logger.warning("Generator aclose() also timed out or errored")
+            await _disconnect(
+                reason="timeout handling",
+                propagate_cancel=False,
+            )
             raise ClaudeTimeoutError(
                 f"Claude call timed out after {timeout}s (use_web={use_web})"
             )
         except asyncio.CancelledError:
-            # If our own task is cancelled externally, clean up the generator too
+            # If our own task is cancelled externally, clean up the client too
             try:
-                await gen.aclose()
-            except Exception:
+                await _disconnect("task cancellation")
+            except asyncio.CancelledError:
                 pass
             raise
+        finally:
+            await _disconnect("normal completion", propagate_cancel=False)
 
         return result
 

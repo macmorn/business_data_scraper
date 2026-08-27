@@ -76,10 +76,16 @@ async def run() -> None:
     try:
         for index, company in enumerate(companies):
             try:
-                await asyncio.wait_for(
-                    _enrich_company(company, clie=client, rate_limiter=rate_limiter, results=results),
-                    timeout=_COMPANY_TIMEOUT,
-                )
+                # Keep the Claude SDK call in this task. `asyncio.wait_for()`
+                # creates a child task, which can make the SDK's anyio cleanup
+                # run in the wrong task after a usage-limit error.
+                async with asyncio.timeout(_COMPANY_TIMEOUT):
+                    await _enrich_company(
+                        company,
+                        clie=client,
+                        rate_limiter=rate_limiter,
+                        results=results,
+                    )
 
                 company.stage = STAGE_PENDING_NORMALIZE
                 db.update_company(company)

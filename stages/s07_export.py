@@ -26,20 +26,33 @@ logger = logging.getLogger(__name__)
 
 def run() -> None:
     """Export all completed companies to CSV."""
-    companies = db.get_pending(STAGE_PENDING_EXPORT, limit=100000)
+    pending = db.get_pending(STAGE_PENDING_EXPORT, limit=100000)
+    if not pending:
+        companies = db.get_all_for_export()
+        if not companies:
+            logger.info("Stage 7: No companies ready for export")
+            return
+        logger.info("Stage 7: No newly pending exports; regenerating existing export")
+    else:
+        # Mark newly exportable rows as done FIRST — prevents duplicates if crash
+        # occurs during CSV write. CSV can always be regenerated from done rows.
+        for c in pending:
+            c.stage = STAGE_DONE
+            db.update_company(c)
+
+        companies = db.get_all_for_export()
+
     if not companies:
-        logger.info("Stage 7: No companies pending export")
+        logger.info("Stage 7: No companies ready for export")
         return
 
     logger.info("=" * 40)
-    logger.info("Stage 7: CSV Export (%d companies)", len(companies))
+    logger.info(
+        "Stage 7: CSV Export (%d companies, %d newly completed)",
+        len(companies),
+        len(pending),
+    )
     logger.info("=" * 40)
-
-    # Mark all as done FIRST — prevents duplicates if crash occurs during CSV write.
-    # CSV can always be regenerated from 'done' companies.
-    for c in companies:
-        c.stage = STAGE_DONE
-        db.update_company(c)
 
     # Build dataframe — dynamically map all CSV_COLUMNS from CompanyRecord
     rows = []
