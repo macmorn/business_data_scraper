@@ -1,0 +1,338 @@
+"""Stage 5: AI enrichment - disambiguation + career summaries.
+
+Uses Claude API for:
+1. Resolving multi-match Northdata results (companies with stage=pending_ai
+   that have northdata_raw with multiple candidates)
+2. Generating CEO career summaries for companies with CEO data
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+
+import cache
+import config
+import db
+from clients import claude_ai
+from clients.northdata_browser import NorthdataClient
+from models import STAGE_PENDING_AI, STAGE_PENDING_NORMALIZE, STAGE_PENDING_CEO
+from stages.s02_northdata import apply_company_data
+from stages.s04_ceo_lookup import _extract_ceo_from_officers
+from utils.logging_setup import ProgressTracker
+from utils.rate_limiter import RateLimiter
+
+logger = logging.getLogger(__name__)
+
+
+def _append_source(company, source: str) -> None:
+    """Append a data source tag if not already present."""
+    sources = company.data_sources_used or ""
+    if source not in sources:
+        company.data_sources_used = f"{sources},{source}" if sources else source
+
+
+async def run() -> None:
+    """Process all companies pending AI enrichment."""
+    companies = db.get_pending(STAGE_PENDING_AI, limit=10000)
+    if not companies:
+        logger.info("Stage 5: No companies pending AI enrichment")
+        return
+
+    logger.info("=" * 40)
+    logger.info("Stage 5: AI Enrichment (%d companies)", len(companies))
+    logger.info("=" * 40)
+
+    tracker = ProgressTracker(len(companies), "ai_enrich")
+    results = {
+        "disambiguated": 0, "summary_generated": 0, "ceo_discovered": 0,
+        "financials_enriched": 0, "skipped": 0, "error": 0,
+        "skipped_usage_limit": 0,
+    }
+
+    # Check if any companies need northdata scraping (disambiguation with URL follow-up)
+    needs_scraping = any(
+        c.northdata_raw and '"status": "multiple"' in c.northdata_raw
+        for c in companies
+    )
+
+    client = None
+    rate_limiter = None
+    if needs_scraping:
+        client = NorthdataClient(
+            email=config.NORTHDATA_EMAIL,
+            password=config.NORTHDATA_PASSWORD,
+            retry_attempts=config.NORTHDATA_RETRY_ATTEMPTS,
+        )
+        await client.start()
+        rate_limiter = RateLimiter(config.NORTHDATA_DELAY_MIN, config.NORTHDATA_DELAY_MAX)
+
+    _COMPANY_TIMEOUT = 600  # 10 min safety net per company
+    source_run = Path(config.INPUT_PDF).stem
+
+    usage_limit_error = None
+    try:
+        for index, company in enumerate(companies):
+            try:
+                # Keep the Claude SDK call in this task. `asyncio.wait_for()`
+                # creates a child task, which can make the SDK's anyio cleanup
+                # run in the wrong task after a usage-limit error.
+                async with asyncio.timeout(_COMPANY_TIMEOUT):
+                    await _enrich_company(
+                        company,
+                        clie=client,
+                        rate_limiter=rate_limiter,
+                        results=results,
+                    )
+
+                company.stage = STAGE_PENDING_NORMALIZE
+                db.update_company(company)
+
+                # Write to global enrichment cache so other runs can reuse
+                try:
+                    cache.store(company, source_run)
+                except Exception as e:
+                    logger.warning("Failed to cache '%s': %s", company.name_original, e)
+
+                action = []
+                if company.ceo_career_summary:
+                    action.append("summary")
+                if company.ceo_linkedin_url:
+                    action.append("linkedin")
+                if company.revenue or company.employees_count:
+                    action.append("financials")
+                tracker.tick(company.name_original, ", ".join(action) if action else "passed through")
+
+            except claude_ai.ClaudeUsageLimitError as e:
+                # Park the current company AND every remaining (unprocessed) company
+                # in this batch for rerun, recording the reason on each. They keep
+                # their retry budget and stay at pending_ai for the next run.
+                remaining = companies[index:]
+                marker = f"usage_limit_reached:{e.subtype}"
+                for pending in remaining:
+                    db.mark_for_rerun(pending.id, marker, STAGE_PENDING_AI)
+                results["skipped_usage_limit"] = len(remaining)
+                logger.error(
+                    "Usage limit reached at '%s' (subtype=%s) — %d of %d companies "
+                    "were NOT AI-enriched (left at stage '%s').",
+                    company.name_original, e.subtype,
+                    len(remaining), len(companies), STAGE_PENDING_AI,
+                )
+                # Capture and stop the loop. We re-raise AFTER the finally below
+                # so that browser teardown (which the Claude SDK's cancel scope
+                # may turn into a CancelledError) can't replace/mask this error
+                # before it reaches the hibernation wrapper.
+                usage_limit_error = e
+                break
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Company '%s' enrichment timed out after %ds, moving on",
+                    company.name_original, _COMPANY_TIMEOUT,
+                )
+                db.mark_failed(company.id, f"enrichment_timeout_{_COMPANY_TIMEOUT}s")
+                results["error"] += 1
+            except Exception as e:
+                logger.error("AI enrichment error for '%s': %s", company.name_original, e)
+                db.mark_failed(company.id, str(e))
+                results["error"] += 1
+    finally:
+        if client:
+            # Best-effort teardown. The Claude SDK's anyio cancel scope can
+            # cancel this task during unwind, turning client.stop() into a
+            # CancelledError (a BaseException). Swallow ALL of it so cleanup can
+            # never mask a propagating ClaudeUsageLimitError.
+            try:
+                await client.stop()
+            except BaseException as e:  # noqa: BLE001 - teardown must not raise
+                logger.warning("Northdata client stop() during Stage 5 teardown failed: %r", e)
+
+    tracker.summary(results)
+
+    # Re-raise the usage limit AFTER cleanup, on a clean stack, so the
+    # hibernation wrapper receives it intact and can sleep + resume.
+    if usage_limit_error is not None:
+        raise usage_limit_error
+
+
+async def _enrich_company(
+    company,
+    *,
+    clie: NorthdataClient | None,
+    rate_limiter: RateLimiter | None,
+    results: dict,
+) -> None:
+    """Run all enrichment tasks for a single company."""
+    # Task 1: Disambiguation (if northdata returned multiple matches)
+    if company.northdata_raw:
+        raw = json.loads(company.northdata_raw)
+        if raw.get("status") == "multiple" and raw.get("matches"):
+            await _disambiguate_company(company, raw["matches"], clie, rate_limiter)
+            results["disambiguated"] += 1
+
+    # Two focused Claude web calls (orchestrated by enrich_company):
+    #   1. business description  2. leadership (CEO/Geschäftsführer)
+    # Financials are NOT requested from Claude — Northdata is the source for them.
+    cname = company.matched_name or company.name_original
+
+    had_ceo_name = bool(company.ceo_name)
+
+    try:
+        data = await claude_ai.enrich_company(
+            company_name=cname,
+            country=company.country,
+            legal_form=company.legal_form,
+            known_ceo_name=company.ceo_name,
+            known_ceo_title=company.ceo_current_title,
+        )
+    except claude_ai.ClaudeUsageLimitError:
+        raise
+    except Exception as e:
+        logger.warning("AI enrichment failed for '%s': %s", company.name_original, e)
+        return
+
+    ceo = data.get("ceo") or {}
+    enriched_something = False
+
+    # --- Apply CEO / leadership ---
+    if had_ceo_name:
+        # We already had a name (from registry/structure stages): only enrich.
+        if ceo.get("career_summary"):
+            company.ceo_career_summary = ceo["career_summary"]
+        if ceo.get("linkedin_url"):
+            company.ceo_linkedin_url = ceo["linkedin_url"]
+        if company.ceo_career_summary:
+            results["summary_generated"] += 1
+            enriched_something = True
+    elif ceo.get("name"):
+        # Newly discovered CEO.
+        company.ceo_name = ceo["name"]
+        company.ceo_current_title = ceo.get("title") or "Managing Director"
+        company.ceo_career_summary = ceo.get("career_summary")
+        company.ceo_linkedin_url = ceo.get("linkedin_url")
+        company.ceo_confidence = "medium"
+        results["ceo_discovered"] += 1
+        enriched_something = True
+        logger.info("  Discovered CEO for '%s': %s", company.name_original, company.ceo_name)
+
+    # --- Apply business description -> corporate structure summary (gap-fill) ---
+    # S04b may have already written a richer related-entity summary; don't clobber it.
+    if not company.corporate_structure_summary and data.get("business_description"):
+        company.corporate_structure_summary = data["business_description"]
+        enriched_something = True
+
+    if enriched_something:
+        _append_source(company, "claude_web")
+
+    # --- Preserve the raw Claude output (don't lose it on parse failure) ---
+    raw = (data.get("raw") or "").strip()
+    if raw:
+        try:
+            envelope = json.loads(company.northdata_raw) if company.northdata_raw else {}
+            if not isinstance(envelope, dict):
+                envelope = {"_prev": company.northdata_raw}
+        except (json.JSONDecodeError, TypeError):
+            envelope = {"_prev": company.northdata_raw}
+        envelope["claude_enrich_raw"] = data.get("raw")
+        company.northdata_raw = json.dumps(envelope, ensure_ascii=False)
+
+    # --- Flag genuinely-empty enrichment for manual review ---
+    # "Empty" = this call produced no usable data AND there was no raw prose to
+    # salvage. A company that already had registry data (CEO/revenue from
+    # Northdata) is NOT flagged — only ones left with nothing.
+    produced_nothing = (
+        not data.get("business_description")
+        and not (data.get("ceo") or {}).get("name")
+        and not (data.get("ceo") or {}).get("career_summary")
+        and not raw
+    )
+    has_any_real_data = bool(
+        (company.corporate_structure_summary or "").strip()
+        or (company.ceo_name or "").strip()
+        or (company.revenue or "").strip()
+        or (company.employees_count or "").strip()
+    )
+    if produced_nothing and not has_any_real_data:
+        company.needs_review_flag = True
+        company.error = "enrichment_empty_response"
+        logger.warning(
+            "  Empty AI response for '%s' — flagged for review (no usable data)",
+            company.name_original,
+        )
+
+
+async def _disambiguate_company(
+    company,
+    matches: list[dict],
+    client: NorthdataClient | None,
+    rate_limiter: RateLimiter | None,
+) -> None:
+    """Use Claude to pick the best match, then scrape the chosen company's page."""
+    context_hints = {}
+    if company.country:
+        context_hints["country_hint"] = company.country
+    if company.address:
+        context_hints["address_hint"] = company.address
+
+    result = await claude_ai.disambiguate(
+        original_name=company.name_original,
+        candidates=matches,
+        context_hints=context_hints if context_hints else None,
+    )
+
+    idx = result.get("index", -1)
+    confidence = result.get("confidence", 0.0)
+
+    if idx >= 0 and idx < len(matches):
+        chosen = matches[idx]
+        company.matched_name = chosen.get("name")
+        company.confidence_score = confidence
+        if confidence < 0.7:
+            company.needs_review_flag = True
+        logger.info(
+            "Disambiguated '%s' -> '%s' (confidence=%.2f)",
+            company.name_original, company.matched_name, confidence,
+        )
+
+        # Scrape the chosen company's northdata page for full data
+        url = chosen.get("url", "")
+        if url and client:
+            if not url.startswith("http"):
+                url = f"https://www.northdata.com{url}"
+            if rate_limiter:
+                await rate_limiter.wait()
+            try:
+                scraped_data = await client.scrape_company_url(url)
+                apply_company_data(company, scraped_data)
+
+                # Update northdata_raw with scraped data for caching
+                raw = json.loads(company.northdata_raw) if company.northdata_raw else {}
+                raw["scraped_data"] = scraped_data
+                raw["disambiguation"] = {"index": idx, "confidence": confidence}
+                company.northdata_raw = json.dumps(raw, ensure_ascii=False)
+
+                # Extract CEO since these companies skipped stage 4
+                if not company.ceo_name and company.officers:
+                    ceo = _extract_ceo_from_officers(company.officers)
+                    if ceo:
+                        company.ceo_name = ceo["name"]
+                        company.ceo_current_title = ceo["role"]
+                        company.ceo_confidence = "high"
+
+                logger.info(
+                    "  Scraped disambiguated '%s' → %s | revenue=%s | employees=%s",
+                    company.name_original, company.matched_name,
+                    company.revenue or "?", company.employees_count or "?",
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to scrape disambiguated URL for '%s': %s",
+                    company.name_original, e,
+                )
+        elif not url:
+            logger.warning("No URL for disambiguated match of '%s'", company.name_original)
+    else:
+        company.needs_review_flag = True
+        company.confidence_score = 0.0
+        logger.info("Could not disambiguate '%s' - flagged for review", company.name_original)

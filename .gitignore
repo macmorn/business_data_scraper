@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Data (large/sensitive)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Output
+output/*.csv
+output/*.log
+
+# Input PDFs (large)
+input/*.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
